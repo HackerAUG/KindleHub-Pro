@@ -13390,12 +13390,23 @@ const Chess=(()=>{
     return wrap;
   }
 
-  /* ── Piece images (Lichess cburnett set) ── */
-  const PIECE_IMG={};
-  'KQRBNPkqrbnp'.split('').forEach(p=>{
-    const col=p===p.toUpperCase()?'w':'b';
-    PIECE_IMG[p]='https://lichess1.org/assets/piece/cburnett/'+col+p.toUpperCase()+'.svg';
-  });
+  /* ── Piece glyphs — inline Unicode, no network.
+     The previous version loaded 12 SVGs from lichess1.org, which cost
+     12 requests per game on a Kindle and rendered broken-image icons
+     whenever the CDN was unreachable — despite the app advertising
+     offline play. The filled glyph is used for both sides; colour plus
+     an outline shadow keeps white and black legible on any square. */
+  const PIECE_GLYPH={K:'♚',Q:'♛',R:'♜',B:'♝',N:'♞',P:'♟'};
+  function mkPieceEl(p,size){
+    const s=document.createElement('span');
+    s.textContent=PIECE_GLYPH[p.toUpperCase()]||'?';
+    const white=p===p.toUpperCase();
+    s.style.cssText='display:block;line-height:1;pointer-events:none;user-select:none;font-size:'+size+'px;'+
+      'font-family:"DejaVu Sans","Segoe UI Symbol","Noto Sans Symbols 2",sans-serif;'+
+      (white?'color:#fff;text-shadow:0 0 1.5px #000,0 0 1.5px #000,0 1px 2px rgba(0,0,0,.55);'
+            :'color:#151515;text-shadow:0 0 1.5px rgba(255,255,255,.45);');
+    return s;
+  }
 
   /* ── Board helpers ── */
   const INIT='rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
@@ -14309,11 +14320,7 @@ const Chess=(()=>{
         tray.appendChild(txt('span','none yet',{style:'font-size:10px;color:var(--muted);font-style:italic;'}));
       } else {
         capList.forEach(p=>{
-          const img=document.createElement('img');
-          img.src=PIECE_IMG[p];
-          img.style.cssText='width:18px;height:18px;display:inline-block;filter:drop-shadow(0 1px 1px rgba(0,0,0,0.3));';
-          img.alt=p;
-          tray.appendChild(img);
+          tray.appendChild(mkPieceEl(p,16));
         });
       }
       if(materialAdvantage>0){
@@ -14372,8 +14379,7 @@ const Chess=(()=>{
         const cell=el('div',{style:`width:${CELL}px;height:${CELL}px;display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative;box-sizing:border-box;background:${bg};`});
 
         if(p){
-          const img=document.createElement('img');
-          img.src=PIECE_IMG[p];
+          const pieceEl=mkPieceEl(p,CELL-10);
           /* In face-to-face 2-player mode, flip ALL black pieces 180°.
              Black starts on rows 0-1 from white's perspective, so the
              black player sits on the opposite side of the device. With
@@ -14381,10 +14387,8 @@ const Chess=(()=>{
              white's side mid-game) rotated, each player always reads
              their own pieces right-way-up. */
           const flipThisPiece=(_flipPieces&&_mode==='2p'&&p===p.toLowerCase());
-          const transform=flipThisPiece?'transform:rotate(180deg);':'';
-          img.style.cssText=`width:${CELL-4}px;height:${CELL-4}px;display:block;pointer-events:none;${transform}`;
-          img.alt=p;
-          cell.appendChild(img);
+          if(flipThisPiece)pieceEl.style.transform='rotate(180deg)';
+          cell.appendChild(pieceEl);
         }
         if(isLeg&&!p){
           const dot=el('div',{style:'width:12px;height:12px;border-radius:50%;background:rgba(0,0,0,0.2);pointer-events:none;'});
@@ -14543,10 +14547,8 @@ const Chess=(()=>{
     const row=el('div',{style:'display:flex;gap:10px;justify-content:center;'});
     const pieces=t==='white'?['Q','R','B','N']:['q','r','b','n'];
     pieces.forEach(pc=>{
-      const btn=el('button',{className:'btn',style:'padding:8px;width:60px;height:60px;'});
-      const img=document.createElement('img');
-      img.src=PIECE_IMG[pc];img.style.cssText='width:40px;height:40px;pointer-events:none;';
-      btn.appendChild(img);
+      const btn=el('button',{className:'btn',style:'padding:8px;width:60px;height:60px;display:flex;align-items:center;justify-content:center;'});
+      btn.appendChild(mkPieceEl(pc,38));
       btn.onclick=()=>{overlay.remove();promotionCb=null;onPick(pc);};
       row.appendChild(btn);
     });
