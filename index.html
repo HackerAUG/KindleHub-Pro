@@ -11250,10 +11250,15 @@ const Hanoi=(function(){
     pegs.forEach((peg,pi)=>{
       const col=el('div',{style:{flex:'1',height:'100%',display:'flex',flexDirection:'column',justifyContent:'flex-end',alignItems:'center',position:'relative',cursor:'pointer',borderBottom:'5px solid var(--fg)',borderRadius:'2px'}});
       col.appendChild(el('div',{style:{position:'absolute',bottom:'0',left:'50%',marginLeft:'-3px',width:'6px',height:'92%',background:'var(--muted)',borderRadius:'3px'}}));
-      peg.forEach((d,di)=>{
+      /* pegs[pi] is ordered bottom→top (index 0 = largest, on the base).
+         A flex-column stacks children top-to-bottom in DOM order, so we
+         must append the TOP disk first and the base disk last — otherwise
+         the widest disk renders at the top and the tower is upside down. */
+      for(let di=peg.length-1;di>=0;di--){
+        const d=peg[di];
         const lifted=(selPeg===pi&&di===peg.length-1);
         col.appendChild(el('div',{style:{position:'relative',zIndex:'1',height:dh+'px',width:(28+(d/disks)*70)+'%',borderRadius:'7px',background:lifted?'var(--fg)':colour(d),border:'2px solid var(--fg)',marginBottom:'3px',boxShadow:'var(--shadow)'}}));
-      });
+      }
       col.onclick=()=>tap(pi);
       board.appendChild(col);
     });
@@ -33240,8 +33245,20 @@ settings:()=>{
       _ultraBox.appendChild(txt('div','Your tier: '+tierName,{style:{fontSize:'12px',fontWeight:'700',marginBottom:'4px'}}));
       if(p.tier!=='creator'){
         _ultraBox.appendChild(txt('div','Active days this week: '+p.windowDays+'/'+p.need+(p.todayQualified?' · today counts ✓':(' · today '+p.todayMin+'/10 min')),{style:{fontSize:'12px',color:'var(--muted)',marginBottom:'4px'}}));
+        /* Visual progress toward Ultra — fills as qualifying days accrue so
+           the path to unlocking is obvious at a glance, not buried in text. */
+        const barOuter=el('div',{style:{height:'10px',borderRadius:'999px',background:'var(--card)',border:'var(--thin)',overflow:'hidden',margin:'2px 0 6px'}});
+        const pctDays=Math.max(0,Math.min(100,Math.round((p.windowDays/Math.max(1,p.need))*100)));
+        barOuter.appendChild(el('div',{style:{height:'100%',width:pctDays+'%',background:'var(--fg)',transition:'width .3s'}}));
+        _ultraBox.appendChild(barOuter);
+        if(p.tier!=='ultra'){
+          const need=Math.max(0,p.need-p.windowDays);
+          const cta=el('div',{style:{fontSize:'12px',fontWeight:'700',color:'var(--fg)',background:'var(--card)',border:'var(--thin)',borderRadius:'8px',padding:'8px 10px',margin:'2px 0 6px',lineHeight:'1.5'}});
+          cta.textContent=need<=0?'You qualify — Ultra unlocks shortly!':('Unlock Ultra: be active '+need+' more day'+(need===1?'':'s')+' this week (just 10+ minutes each).');
+          _ultraBox.appendChild(cta);
+        }
       }
-      _ultraBox.appendChild(txt('div',p.tier==='creator'?'Unlimited storage, full AI, and the Creator badge — forever.':(p.tier==='ultra'?'You have Ultra: first-come AI + KHI, 3 MB cloud storage, and the Big Contributor badge. Use KindleHub 3 days a week (10+ min each) to keep it — it rolls, so a steady week never lets it lapse.':'Use KindleHub 3 days a week, 10+ minutes each, to unlock Ultra: more AI, KHI, 3 MB storage and a badge. It rolls like a points system — stay active 3×/week and you never lose it.'),{style:{fontSize:'11px',color:'var(--muted)',lineHeight:'1.5'}}));
+      _ultraBox.appendChild(txt('div',p.tier==='creator'?'Unlimited storage, full AI, and the Creator badge — forever.':(p.tier==='ultra'?'You have Ultra: first-come AI + KHI, 3 MB cloud storage, and the Big Contributor badge. Use KindleHub 3 days a week (10+ min each) to keep it — it rolls, so a steady week never lets it lapse.':'Ultra perks: more AI + KHI, 3 MB cloud storage, and a Big Contributor badge. It works like a rolling points system — stay active 3×/week (10+ min each) and you never lose it. No payment, ever.'),{style:{fontSize:'11px',color:'var(--muted)',lineHeight:'1.5'}}));
       const rf=txt('button','Refresh',{className:'btn small',style:{marginTop:'8px',fontSize:'10px'}});rf.onclick=function(){try{if(typeof _khUltraTick==='function')_khUltraTick(0);}catch(_){}_renderUltra();};
       _ultraBox.appendChild(rf);
     }
@@ -34095,7 +34112,44 @@ settings:()=>{
   fbRow.append(tourBtn,welcomeBtn,fbBtn);cFb.appendChild(fbRow);
   g.appendChild(cFb);
 
-
+  /* ── Contributors ─────────────────────────────────────────────────────
+     Credits the AI collaborators that built KindleHub and every user who
+     filed a bug report or feature suggestion. Human names are read from the
+     local kh_contributors cache that the Feedback board fills in from data
+     it already fetched — so this card adds ZERO Supabase bandwidth. */
+  const cContrib=el('div',{className:'card',style:{gridColumn:'1/-1'}});
+  cContrib.appendChild(txt('h2','Contributors'));
+  cContrib.appendChild(txt('p','KindleHub was designed and built collaboratively with these AI models, and shaped by the community.',{style:{fontSize:'12px',color:'var(--muted)',lineHeight:'1.5',marginBottom:'8px'}}));
+  const _aiContribs=[
+    ['Fable 5','Anthropic'],
+    ['Claude Opus 4.8','Anthropic'],
+    ['Claude Opus 4.7','Anthropic'],
+    ['Claude Sonnet 4.6','Anthropic'],
+    ['ChatGPT 5','OpenAI'],
+    ['ChatGPT 4o','OpenAI'],
+    ['DeepSeek','DeepSeek'],
+  ];
+  cContrib.appendChild(txt('div','AI collaborators',{style:{fontSize:'11px',fontWeight:'800',textTransform:'uppercase',letterSpacing:'.5px',color:'var(--muted)',margin:'4px 0 6px'}}));
+  const aiGrid=el('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(150px,1fr))',gap:'6px',marginBottom:'12px'}});
+  _aiContribs.forEach(([name,org])=>{
+    const chip=el('div',{style:{border:'var(--thin)',borderRadius:'8px',padding:'7px 10px',background:'var(--highlight)'}});
+    chip.appendChild(txt('div',name,{style:{fontSize:'12px',fontWeight:'700'}}));
+    chip.appendChild(txt('div',org,{style:{fontSize:'10px',color:'var(--muted)'}}));
+    aiGrid.appendChild(chip);
+  });
+  cContrib.appendChild(aiGrid);
+  cContrib.appendChild(txt('div','Community contributors',{style:{fontSize:'11px',fontWeight:'800',textTransform:'uppercase',letterSpacing:'.5px',color:'var(--muted)',margin:'4px 0 6px'}}));
+  let _humans=[];try{const _h=JSON.parse(localStorage.getItem('kh_contributors')||'[]');if(Array.isArray(_h))_humans=_h.filter(Boolean);}catch(_){}
+  if(_humans.length){
+    const hWrap=el('div',{style:{display:'flex',flexWrap:'wrap',gap:'5px'}});
+    _humans.sort((a,b)=>a.localeCompare(b)).forEach(n=>{
+      const tag=el('span',{style:{fontSize:'11px',fontWeight:'600',padding:'3px 9px',borderRadius:'999px',border:'var(--thin)',background:'var(--card)'}});
+      tag.textContent=n;hWrap.appendChild(tag);
+    });
+    cContrib.appendChild(hWrap);
+  }
+  cContrib.appendChild(txt('p','…and everyone who submitted a bug report or feature suggestion. Thank you — your feedback shaped this app. Open the Feedback board and post to see your name added here.',{style:{fontSize:'11px',color:'var(--muted)',lineHeight:'1.55',marginTop:_humans.length?'8px':'0'}}));
+  g.appendChild(cContrib);
 
   });/* end last deferred card */
   return v;
@@ -35972,6 +36026,15 @@ Deno.serve(async (req)=>{
     setStatus('Loading...');
     try{
       items=(await fbRead(activeType)).filter(i=>i&&i.id&&i.text);
+      /* Harvest contributor names from feedback we already fetched (zero
+         extra bandwidth) so the Settings → Contributors card can credit
+         everyone who filed a bug or suggestion. Cached in localStorage. */
+      try{
+        const cur=JSON.parse(localStorage.getItem('kh_contributors')||'[]');
+        const set=new Set(Array.isArray(cur)?cur:[]);
+        items.forEach(i=>{const a=(i.author||'').trim();if(a&&a.toLowerCase()!=='anonymous'&&a.toLowerCase()!=='anon')set.add(a.slice(0,40));});
+        localStorage.setItem('kh_contributors',JSON.stringify([...set].slice(0,300)));
+      }catch(_){}
       setStatus('');
     }catch(e){
       setStatus('Could not load — check internet connection.',true);items=[];
