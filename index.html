@@ -31537,10 +31537,14 @@ tools:()=>{
   notes.appendChild(txt('h2','Quick Notes'));
   const nsearch=el('div',{style:{display:'flex',gap:'5px',marginBottom:'6px'}});
   const ni=el('input',{id:'noteSearch',placeholder:'Search notes...',style:{flex:'1'}});
-  ni.oninput=()=>renderNotes(ni.value,($('noteTagFilter')||{}).value||'');
+  /* Debounced — rebuilding the whole note list on EVERY keystroke made
+     typing in search feel laggy on e-ink once you had a few dozen notes. */
+  let _noteSearchT=null;
+  const _noteSearchGo=()=>renderNotes(($('noteSearch')||{}).value||'',($('noteTagFilter')||{}).value||'');
+  ni.oninput=()=>{if(_noteSearchT)clearTimeout(_noteSearchT);_noteSearchT=setTimeout(_noteSearchGo,180);};
   nsearch.appendChild(ni);
   const tf=el('input',{id:'noteTagFilter',placeholder:'#tag',style:{width:'90px',flex:'none'}});
-  tf.oninput=()=>renderNotes(($('noteSearch')||{}).value||'',tf.value);
+  tf.oninput=()=>{if(_noteSearchT)clearTimeout(_noteSearchT);_noteSearchT=setTimeout(_noteSearchGo,180);};
   nsearch.appendChild(tf);notes.appendChild(nsearch);
   const nta=el('textarea',{id:'noteBody',rows:'3',placeholder:'Type note... use #tags'});
   notes.appendChild(nta);
@@ -31989,7 +31993,9 @@ reading:()=>{
   /* Filter row */
   const filterRow=el('div',{style:{display:'flex',gap:'5px',marginBottom:'6px',flexWrap:'wrap'}});
   const bs=el('input',{id:'bookSearch',placeholder:'Search title or author...',style:{flex:'1',minWidth:'120px'}});
-  bs.oninput=()=>renderBooks();
+  /* Debounced — full library re-render per keystroke lagged on e-ink. */
+  let _bookSearchT=null;
+  bs.oninput=()=>{if(_bookSearchT)clearTimeout(_bookSearchT);_bookSearchT=setTimeout(()=>renderBooks(),180);};
   const statusFilter=el('select',{id:'bookStatusFilter',style:{fontSize:'11px',padding:'4px',border:'var(--thin)',borderRadius:'4px',background:'var(--card)',color:'var(--fg)'}});
   [['all','All'],['to-read','To Read'],['reading','Reading'],['finished','Finished']].forEach(([v2,t])=>{const o=el('option',{value:v2});o.textContent=t;statusFilter.appendChild(o);});
   statusFilter.onchange=()=>renderBooks();
@@ -37196,11 +37202,22 @@ starmap:()=>{
       '#view-starmap{font-family:var(--ui-font,sans-serif);}'+
       '.sm-canvas{position:absolute;top:0;right:0;bottom:0;left:0;display:block;touch-action:none;background:#060610;z-index:0;}'+
       '.sm-fab{position:absolute;z-index:30;background:rgba(13,13,26,0.92);color:#fff;border:1.5px solid #fff;border-radius:50%;width:42px;height:42px;display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:900;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,0.6);font-family:var(--ui-font,sans-serif);}'+
+      /* The floating chips (city pill, menu, guide) sit at z-index 30 —
+         ABOVE the slide-down settings panel (25) — so with the panel open
+         they covered its header text. Hide them while it is open; the
+         panel has its own close button and city selector. */
+      '.sm-settings-panel.open~.sm-fab{display:none;}'+
       '.sm-fab:active{background:#fff;color:#000;}'+
       '.sm-fab-menu{top:10px;right:10px;}'+
       '.sm-fab-guide{top:10px;right:60px;font-size:13px;width:auto;height:42px;border-radius:21px;padding:0 14px;background:#fff;color:#000;border-color:#000;font-weight:800;letter-spacing:0.3px;}'+
       '.sm-fab-city{top:10px;left:10px;font-size:11px;width:auto;height:32px;border-radius:16px;padding:0 12px;background:rgba(13,13,26,0.92);color:#fff;border:1.5px solid #fff;font-weight:700;}'+
       '.sm-settings-panel{position:absolute;top:0;left:0;right:0;background:#0d0d1a;border-bottom:2px solid #fff;padding:12px 10px;z-index:25;max-height:65vh;overflow-y:auto;-webkit-overflow-scrolling:touch;transform:translateY(-110%);transition:transform .22s ease-out;box-shadow:0 8px 24px rgba(0,0,0,0.7);}'+
+      /* Opaque select menus — Kindle WebKit renders the open option list
+         in-page with the select's own colours; without these the city
+         picker's menu overlapped (and showed through onto) the text
+         beneath it. */
+      '#view-starmap select{background:#1a1a35;color:#cce;}'+
+      '#view-starmap select option{background:#0d0d1a;color:#cce;}'+
       '.sm-settings-panel.open{transform:translateY(0);}'+
       '.sm-settings-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;padding-bottom:8px;border-bottom:1px solid #334;}'+
       '.sm-settings-title{font-size:13px;font-weight:800;text-transform:uppercase;letter-spacing:0.6px;color:#fff;flex:1;}'+
@@ -37252,7 +37269,13 @@ starmap:()=>{
      other location-aware pages stay in sync. */
   const cityWrap=el('div',{style:'display:flex;align-items:center;gap:5px;padding:3px 6px 3px 9px;background:#1a1a35;border:1px solid #334;border-radius:14px;flex-shrink:0;'});
   cityWrap.innerHTML='<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#cce" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>';
-  const citySel=el('select',{style:'background:transparent;border:none;color:#cce;font-size:11px;font-weight:700;font-family:var(--ui-font);cursor:pointer;outline:none;padding:2px 0 2px 2px;-webkit-appearance:menulist;appearance:auto;'});
+  /* Solid background, NOT transparent: on Kindle WebKit the opened option
+     list inherits the select's styling, so a transparent select painted its
+     menu straight over the star canvas / bar text underneath — light text
+     on whatever happened to be below it. An opaque pill keeps the open
+     menu legible everywhere. Option colours are pinned in the injected
+     starmap CSS for the same reason. */
+  const citySel=el('select',{style:'background:#1a1a35;border:none;color:#cce;font-size:11px;font-weight:700;font-family:var(--ui-font);cursor:pointer;outline:none;padding:2px 0 2px 2px;-webkit-appearance:menulist;appearance:auto;max-width:46vw;'});
   /* Build option list: dedupe by name, sort alphabetically, current city pre-selected. */
   const seenCities={};
   (CITIES||[]).forEach(c=>{const k=c.n||c.name;if(k&&!seenCities[k])seenCities[k]=c;});
