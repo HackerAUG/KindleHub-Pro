@@ -136,6 +136,11 @@ create table if not exists kh_announcements (
   targets    jsonb default '[]'::jsonb,
   created_at timestamptz default now()
 );
+-- Repair tables created by older bootstraps where id had NO default:
+-- inserts then failed with 23502 "null value in column id". Safe to re-run.
+create sequence if not exists kh_announcements_id_seq;
+alter table kh_announcements alter column id set default nextval('kh_announcements_id_seq');
+select setval('kh_announcements_id_seq', coalesce((select max(id) from kh_announcements),0)+1, false);
 
 create table if not exists kh_presence (
   user_id      text primary key,

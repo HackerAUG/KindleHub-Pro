@@ -8413,13 +8413,12 @@ async function _khFetchScores(game,limit){
     if(typeof _khLoadBanned==='function'){try{await _khLoadBanned(false);}catch(_){}}
     const rows=await _sbSelect('kh_scores','game=eq.'+encodeURIComponent(game)+'&order=score.desc&limit='+limit+'&select=score,display_name,date');
     if(!Array.isArray(rows))return[];
-    /* Mask admin-banned usernames everywhere scores are shown (leaderboards,
-       best-score badge, admin stats) — a single chokepoint so no render
-       site can leak a banned name. */
-    if(typeof _dispName==='function'){
-      rows.forEach(r=>{if(r&&r.display_name)r.display_name=_dispName(r.display_name);});
-    }
-    return rows;
+    /* Banned users are REMOVED from every score list entirely (not just
+       masked as '[removed]') — one chokepoint covers leaderboards, the
+       best-score badge and admin stats. */
+    let out=rows;
+    if(typeof _khIsBannedSync==='function')out=rows.filter(r=>!(r&&r.display_name&&_khIsBannedSync(r.display_name)));
+    return out;
   }catch(e){console.warn('Fetch scores failed',e&&e.message);return[];}
 }
 
@@ -8698,15 +8697,45 @@ async function _groupFetchMessages(code){
    and costs zero extra requests. */
 const KH_MAIL_DOMAIN='kindlehub.pro';
 function _mailNorm(u){return String(u||'').trim().toLowerCase().replace(/@.*$/,'').slice(0,40);}
+/* External = a full address at any OTHER domain (alice@gmail.com). Internal
+   = a bare username or username@kindlehub.pro. */
+function _mailIsExternal(addr){
+  const a=String(addr||'').trim().toLowerCase();
+  if(!a.includes('@'))return false;
+  return !a.endsWith('@'+KH_MAIL_DOMAIN);
+}
+/* Outbound gateway for REAL internet email — a Cloudflare Worker (see
+   email-worker.js in the repo) that fronts an email API and also receives
+   inbound mail for @kindlehub.pro via Email Routing. The URL is set once
+   by the admin; empty = external sending disabled with a clear message. */
+function _mailGatewayUrl(){
+  try{const o=(localStorage.getItem('kh_mail_gateway')||'').trim();if(o)return o.replace(/\/+$/,'');}catch(_){}
+  return '';
+}
 function _myMailUser(){return _mailNorm(S.email||'');}
 function _mailState(){if(!S.mailState||typeof S.mailState!=='object')S.mailState={};return S.mailState;}
 async function _mailSend(toUser,subject,body,replyTo){
   if(!_sbActive())throw new Error('Mail needs the cloud backend — check your connection.');
-  const to=_mailNorm(toUser);
-  if(!to)throw new Error('Enter a recipient username.');
-  /* Tiny existence check so typos bounce immediately instead of vanishing. */
-  const hit=await _sbSelect('kh_users','email=eq.'+encodeURIComponent(to)+'&select=email&limit=1');
-  if(!Array.isArray(hit)||!hit.length)throw new Error('No KindleHub account called "'+to+'" — check the address.');
+  const external=_mailIsExternal(toUser);
+  const to=external?String(toUser).trim().toLowerCase().slice(0,120):_mailNorm(toUser);
+  if(!to)throw new Error('Enter a recipient.');
+  if(external){
+    /* Real internet email — relayed through the Cloudflare Worker gateway,
+       which sends from username@kindlehub.pro via the email API. */
+    const gw=_mailGatewayUrl();
+    if(!gw)throw new Error('Sending to outside addresses isn\'t switched on yet for this KindleHub — the admin needs to deploy the mail gateway (email-worker.js).');
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(to))throw new Error('"'+to+'" doesn\'t look like a valid email address.');
+    const r=await fetch(gw+'/send',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({to:to,from_user:_myMailUser(),subject:String(subject||'(no subject)').slice(0,160),body:String(body||'').slice(0,8000)})});
+    if(!r.ok){let t='';try{t=(await r.json()).error||'';}catch(_){}throw new Error(t||('Gateway error '+r.status+' — mail not sent.'));}
+  }else{
+    /* Tiny existence check so typos bounce immediately instead of vanishing. */
+    const hit=await _sbSelect('kh_users','email=eq.'+encodeURIComponent(to)+'&select=email&limit=1');
+    if(!Array.isArray(hit)||!hit.length)throw new Error('No KindleHub account called "'+to+'" — for outside addresses include the full domain (e.g. name@gmail.com).');
+  }
+  /* One kh_mail row either way: the recipient's copy for internal mail, or
+     OUR Sent-folder copy for external (to_user holds the full address, which
+     also keys the encryption — _mailFetch derives the same key back). */
   const id='m_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7);
   const secret=(typeof _newSecret==='function')?_newSecret():(String(Math.random()).slice(2)+Date.now());
   const encSubject=await _msgEncrypt('mail:'+to,String(subject||'(no subject)').slice(0,160));
@@ -25455,7 +25484,7 @@ const KINDLEHUB_MANUAL=[
 "",
 "## KindleHub Mail — your @kindlehub.pro address",
 "",
-"Every signed-in user automatically has a mail address: their username followed by @kindlehub.pro. Open the Mail tab to use it like a normal inbox — Inbox, Sent, Archive and Trash folders, Compose, Reply, Forward, and Unsend for mail you sent. To write to someone you only need their KindleHub username. Mail is encrypted in transit and at rest, read/archive state syncs across your devices, and a dot appears on the Mail tab when something new arrives. It delivers between KindleHub accounts (it is not connected to outside email like Gmail — the Mail tab has launcher buttons for those).",
+"Every signed-in user automatically has a mail address: their username followed by @kindlehub.pro. Open the Mail tab to use it like a normal inbox — Inbox, Sent, Archive and Trash folders, Compose, Reply, Forward, and Unsend for mail you sent. To write to someone you only need their KindleHub username. Mail is encrypted in transit and at rest, read/archive state syncs across your devices, and a dot appears on the Mail tab when something new arrives. It delivers between KindleHub accounts out of the box, and once the admin deploys the mail gateway (email-worker.js) it becomes a full internet address: outside mail sent to username@kindlehub.pro lands in your inbox, and Compose accepts any address (e.g. name@gmail.com) — the suffix disappears as you type a full address. Sent internet mail shows in Sent with a Delete-copy option (a delivered email can't be recalled).",
 "",
 "## Messages — chat groups and history caps",
 "",
@@ -34348,6 +34377,7 @@ settings:()=>{
   cContrib.appendChild(aiGrid);
   cContrib.appendChild(txt('div','Community contributors',{style:{fontSize:'11px',fontWeight:'800',textTransform:'uppercase',letterSpacing:'.5px',color:'var(--muted)',margin:'4px 0 6px'}}));
   let _humans=[];try{const _h=JSON.parse(localStorage.getItem('kh_contributors')||'[]');if(Array.isArray(_h))_humans=_h.filter(Boolean);}catch(_){}
+  if(typeof _khIsBannedSync==='function')_humans=_humans.filter(n=>!_khIsBannedSync(n));
   if(_humans.length){
     const hWrap=el('div',{style:{display:'flex',flexWrap:'wrap',gap:'5px'}});
     _humans.sort((a,b)=>a.localeCompare(b)).forEach(n=>{
@@ -34657,6 +34687,7 @@ feedback:()=>{
         let rows;
         try{
           rows=await _sbSelect('kh_presence','select=user_id,display_name,last_seen&last_seen=gte.'+encodeURIComponent(since)+'&order=last_seen.desc&limit=500');
+          if(typeof _khIsBannedSync==='function'&&Array.isArray(rows))rows=rows.filter(r=>!_khIsBannedSync(r&&r.display_name));
         }catch(e){
           onlineBox.innerHTML='';
           onlineBox.appendChild(txt('span','kh_presence table not found. ',{style:{color:'var(--danger)',fontWeight:'700'}}));
@@ -35787,6 +35818,15 @@ Deno.serve(async (req)=>{
       const ul=el('div',{style:{fontSize:'11px',color:'var(--muted)',lineHeight:'1.6'}});
       meas.forEach(m=>ul.appendChild(txt('div','✓ '+m)));
       c.appendChild(ul);
+      /* Mail gateway — paste the deployed email-worker.js URL here to switch
+         on real internet email (see the worker file for the 10-min setup). */
+      c.appendChild(txt('div','Mail gateway (external email)',{style:{fontSize:'11px',fontWeight:'800',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.5px',margin:'12px 0 4px'}}));
+      const gwRow=el('div',{style:{display:'flex',gap:'5px'}});
+      const gwIn=el('input',{type:'text',placeholder:'https://your-worker.workers.dev',value:(localStorage.getItem('kh_mail_gateway')||''),style:{flex:'1',fontSize:'11px',fontFamily:'monospace'}});
+      const gwSave=txt('button','Save',{className:'btn small'});
+      gwSave.onclick=()=>{try{const v=gwIn.value.trim();if(v)localStorage.setItem('kh_mail_gateway',v);else localStorage.removeItem('kh_mail_gateway');toast(v?'Gateway saved — external email is ON for this device.':'Gateway cleared.');}catch(_){}};
+      gwRow.append(gwIn,gwSave);c.appendChild(gwRow);
+      c.appendChild(txt('div','Deploy email-worker.js (in the repo) to Cloudflare, then paste its URL. Inbound mail needs no URL — it flows via Email Routing once the worker is live.',{style:{fontSize:'10px',color:'var(--muted)',marginTop:'4px',lineHeight:'1.5'}}));
       return c;
     }
     async function renderErrPanel(){
@@ -36284,7 +36324,7 @@ Deno.serve(async (req)=>{
       try{
         const cur=JSON.parse(localStorage.getItem('kh_contributors')||'[]');
         const set=new Set(Array.isArray(cur)?cur:[]);
-        items.forEach(i=>{const a=(i.author||'').trim();if(a&&a.toLowerCase()!=='anonymous'&&a.toLowerCase()!=='anon')set.add(a.slice(0,40));});
+        items.forEach(i=>{const a=(i.author||'').trim();if(!a||a.toLowerCase()==='anonymous'||a.toLowerCase()==='anon')return;if(typeof _khIsBannedSync==='function'&&_khIsBannedSync(a))return;set.add(a.slice(0,40));});
         localStorage.setItem('kh_contributors',JSON.stringify([...set].slice(0,300)));
       }catch(_){}
       setStatus('');
@@ -43844,7 +43884,12 @@ mail:()=>{
     khCard.appendChild(goBtn);
   } else {
     const myAddr=_myMailUser()+'@'+KH_MAIL_DOMAIN;
-    khHdr.appendChild(txt('span',myAddr,{style:{fontSize:'11px',fontFamily:'monospace',color:'var(--muted)'}}));
+    const addrWrap=el('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px'}});
+    addrWrap.appendChild(txt('span',myAddr,{style:{fontSize:'11px',fontFamily:'monospace',color:'var(--muted)'}}));
+    const extOn=!!_mailGatewayUrl();
+    const extChip=txt('span',extOn?'internet mail: on':'KindleHub-only',{title:extOn?'This address can mail any email address on the internet.':'Sends between KindleHub accounts. The admin can enable internet mail by deploying email-worker.js.',style:{fontSize:'9px',fontWeight:'800',letterSpacing:'.4px',textTransform:'uppercase',padding:'2px 7px',borderRadius:'999px',border:'var(--thin)',color:extOn?'var(--bg)':'var(--muted)',background:extOn?'var(--fg)':'var(--card)'}});
+    addrWrap.appendChild(extChip);
+    khHdr.appendChild(addrWrap);
     khCard.appendChild(khHdr);
     /* Folder chips + actions */
     let folder='inbox',mails=[],openId=null,loading=false,query='';
@@ -43865,6 +43910,9 @@ mail:()=>{
     }
     function setMailFlag(id,patch){const s=st();s[id]=Object.assign({},s[id]||{},patch);save();}
     function fmtTs(ts){try{const d=new Date(ts);return d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}catch(_){return '';}}
+    /* Bare usernames get the home domain; full external addresses (anything
+       already containing @) pass through untouched. */
+    function _addrLbl(a){a=String(a||'');return a.includes('@')?a:(a+'@'+KH_MAIL_DOMAIN);}
     function unreadCount(){
       if(folder==='sent')return 0;
       return mails.filter(m=>effFolder(m)==='inbox'&&!(st()[m.id]||{}).read).length;
@@ -43908,7 +43956,7 @@ mail:()=>{
         const who=folder==='sent'?('To: '+m.to):(m.from);
         if(typeof _avatarEl==='function')line1.appendChild(_avatarEl(folder==='sent'?m.to:m.from,24));
         const whoCol=el('div',{style:{flex:'1',minWidth:'0'}});
-        whoCol.appendChild(txt('div',who+'@'+KH_MAIL_DOMAIN,{style:{fontSize:'12px',fontWeight:unread?'900':'600',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
+        whoCol.appendChild(txt('div',_addrLbl(who),{style:{fontSize:'12px',fontWeight:unread?'900':'600',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
         whoCol.appendChild(txt('div',m.subject||'(no subject)',{style:{fontSize:'12px',fontWeight:unread?'800':'400',color:unread?'var(--fg)':'var(--muted)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
         line1.appendChild(whoCol);
         line1.appendChild(txt('span',fmtTs(m.ts),{style:{fontSize:'10px',color:'var(--muted)',flexShrink:'0',alignSelf:'flex-start',marginTop:'2px'}}));
@@ -43921,8 +43969,8 @@ mail:()=>{
         if(openId===m.id){
           /* Reading pane header — who/when in full, then the body */
           const hdrBox=el('div',{style:{margin:'8px 0 0',padding:'8px 10px',background:'var(--card)',border:'var(--thin)',borderRadius:'8px 8px 0 0',fontSize:'11px',color:'var(--muted)',lineHeight:'1.6'}});
-          hdrBox.appendChild(txt('div','From: '+(folder==='sent'?_myMailUser():m.from)+'@'+KH_MAIL_DOMAIN));
-          hdrBox.appendChild(txt('div','To: '+m.to+'@'+KH_MAIL_DOMAIN+'   ·   '+fmtTs(m.ts)));
+          hdrBox.appendChild(txt('div','From: '+_addrLbl(folder==='sent'?_myMailUser():m.from)));
+          hdrBox.appendChild(txt('div','To: '+_addrLbl(m.to)+'   ·   '+fmtTs(m.ts)));
           row.appendChild(hdrBox);
           const body=el('div',{style:{margin:'0 0 8px',padding:'10px',background:'var(--highlight)',borderRadius:'0 0 8px 8px',fontSize:'13px',lineHeight:'1.65',whiteSpace:'pre-wrap',wordBreak:'break-word'}});
           body.textContent=m.body||'(empty)';
@@ -43958,14 +44006,16 @@ mail:()=>{
             rep.onclick=ev=>{ev.stopPropagation();composeModal(m.from,'Re: '+(m.subject||''),'\n\n— On '+fmtTs(m.ts)+', '+m.from+' wrote —\n'+(m.body||'').split('\n').map(l=>'> '+l).join('\n'),m.id);};
             acts.appendChild(rep);
             const fwd=txt('button','Forward',{className:'btn small'});
-            fwd.onclick=ev=>{ev.stopPropagation();composeModal('','Fwd: '+(m.subject||''),'\n\n— Forwarded from '+m.from+'@'+KH_MAIL_DOMAIN+' —\n'+(m.body||''));};
+            fwd.onclick=ev=>{ev.stopPropagation();composeModal('','Fwd: '+(m.subject||''),'\n\n— Forwarded from '+_addrLbl(m.from)+' —\n'+(m.body||''));};
             acts.appendChild(fwd);
             if(effFolder(m)!=='archive'){const ar=txt('button','Archive',{className:'btn small'});ar.onclick=ev=>{ev.stopPropagation();setMailFlag(m.id,{folder:'archive'});renderList();};acts.appendChild(ar);}
             else{const un=txt('button','To Inbox',{className:'btn small'});un.onclick=ev=>{ev.stopPropagation();setMailFlag(m.id,{folder:'inbox'});renderList();};acts.appendChild(un);}
             if(effFolder(m)!=='trash'){const tr=txt('button','Trash',{className:'btn small',style:{color:'var(--danger)',borderColor:'var(--danger)'}});tr.onclick=ev=>{ev.stopPropagation();setMailFlag(m.id,{folder:'trash'});openId=null;renderList();};acts.appendChild(tr);}
           } else {
             const un=txt('button','Unsend',{className:'btn small',style:{color:'var(--danger)',borderColor:'var(--danger)'}});
-            un.onclick=async ev=>{ev.stopPropagation();if(!await kindleConfirm('Unsend this mail? It disappears from the recipient too.'))return;
+            const _ext=_mailIsExternal(m.to);
+            if(_ext)un.textContent='Delete copy';
+            un.onclick=async ev=>{ev.stopPropagation();if(!await kindleConfirm(_ext?'Delete your copy? (The email itself was already delivered and can\'t be recalled.)':'Unsend this mail? It disappears from the recipient too.'))return;
               try{await _mailUnsend(m.id);mails=mails.filter(x=>x.id!==m.id);openId=null;renderList();toast('Mail unsent.');}
               catch(e2){toast(String(e2&&e2.message||'Could not unsend.'),3500);}};
             acts.appendChild(un);
@@ -44000,8 +44050,14 @@ mail:()=>{
       const box=el('div',{style:{background:'var(--card)',borderRadius:'12px',padding:'14px',width:'100%',maxWidth:'460px',maxHeight:'90vh',overflowY:'auto',boxShadow:'var(--shadow-md)'}});
       box.appendChild(txt('h3','New mail',{style:{margin:'0 0 8px',fontFamily:'var(--title-font)'}}));
       const toRow=el('div',{style:{display:'flex',alignItems:'center',gap:'4px',marginBottom:'6px'}});
-      const toIn=el('input',{type:'text',placeholder:'username',value:toPre||'',style:{flex:'1',fontSize:'13px'}});
-      toRow.appendChild(toIn);toRow.appendChild(txt('span','@'+KH_MAIL_DOMAIN,{style:{fontSize:'12px',color:'var(--muted)',fontFamily:'monospace'}}));
+      const toIn=el('input',{type:'text',placeholder:'username or name@gmail.com',value:toPre||'',style:{flex:'1',fontSize:'13px'}});
+      toRow.appendChild(toIn);
+      const sufSpan=txt('span','@'+KH_MAIL_DOMAIN,{style:{fontSize:'12px',color:'var(--muted)',fontFamily:'monospace'}});
+      toRow.appendChild(sufSpan);
+      /* Typing a full address (anything with @) suppresses the suffix —
+         that's how you mail the outside world (alice@gmail.com). */
+      const _sufSync=()=>{sufSpan.style.display=toIn.value.includes('@')?'none':'';};
+      toIn.addEventListener('input',_sufSync);_sufSync();
       box.appendChild(toRow);
       const subjIn=el('input',{type:'text',placeholder:'Subject',value:subjPre||'',style:{width:'100%',fontSize:'13px',marginBottom:'6px'}});
       box.appendChild(subjIn);
@@ -44051,7 +44107,7 @@ mail:()=>{
         send.disabled=true;send.textContent='Sending…';
         try{
           await _mailSend(toIn.value,subjIn.value,bodyIn.value,replyTo);
-          ov.remove();toast('Mail sent to '+_mailNorm(toIn.value)+'@'+KH_MAIL_DOMAIN,3000);
+          ov.remove();toast('Mail sent to '+_addrLbl(toIn.value.trim().toLowerCase()),3000);
           if(folder==='sent')loadMail();
         }catch(e){send.disabled=false;send.textContent='Send';toast(String(e&&e.message||'Send failed.'),4000);}
       };
