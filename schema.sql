@@ -136,6 +136,11 @@ create table if not exists kh_announcements (
   targets    jsonb default '[]'::jsonb,
   created_at timestamptz default now()
 );
+-- Repair tables created by older bootstraps where id had NO default:
+-- inserts then failed with 23502 "null value in column id". Safe to re-run.
+create sequence if not exists kh_announcements_id_seq;
+alter table kh_announcements alter column id set default nextval('kh_announcements_id_seq');
+select setval('kh_announcements_id_seq', coalesce((select max(id) from kh_announcements),0)+1, false);
 
 create table if not exists kh_presence (
   user_id      text primary key,
@@ -453,6 +458,44 @@ drop   trigger if exists kh_messages_cap on kh_messages;
 create trigger kh_messages_cap
   after insert on kh_messages
   for each row execute function kh_messages_cap_trigger();
+
+-- v8.3 STORAGE GUARD: cap kh_mail so it can't grow forever. Keep the newest
+-- 60 messages per recipient (to_user). Mirrors the kh_messages cap.
+create or replace function kh_mail_cap_trigger()
+  returns trigger language plpgsql security definer as $body$
+begin
+  delete from kh_mail
+    where to_user = new.to_user
+      and id not in (
+        select id from kh_mail
+        where to_user = new.to_user
+        order by ts desc
+        limit 60
+      );
+  return null;
+end;
+$body$;
+drop   trigger if exists kh_mail_cap on kh_mail;
+create trigger kh_mail_cap
+  after insert on kh_mail
+  for each row execute function kh_mail_cap_trigger();
+
+-- v8.3 STORAGE GUARD: cap kh_errors at ~600 newest rows globally so the
+-- crash/diagnostics log from many users can't fill the database.
+create or replace function kh_errors_cap_trigger()
+  returns trigger language plpgsql security definer as $body$
+begin
+  if (random() < 0.05) then   -- only sweep ~1 insert in 20 (cheap)
+    delete from kh_errors
+      where id not in (select id from kh_errors order by date desc limit 600);
+  end if;
+  return null;
+end;
+$body$;
+drop   trigger if exists kh_errors_cap on kh_errors;
+create trigger kh_errors_cap
+  after insert on kh_errors
+  for each row execute function kh_errors_cap_trigger();
 
 create or replace function kh_feedback_rate_trigger()
   returns trigger language plpgsql as $body$

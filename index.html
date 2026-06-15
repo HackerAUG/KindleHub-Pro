@@ -115,6 +115,12 @@ nav{
   scroll-snap-type:x proximity;
 }
 nav::-webkit-scrollbar{display:none}
+/* Landscape v2: #app sizes against 100vh of the BROWSER viewport, but the
+   rotated container's visible height is the viewport WIDTH — without this
+   clamp the lower part of every view (chat composer, calc keys) fell off
+   the visible edge. The one rule that matters. */
+#rotateRoot[data-rotated="1"] #app{height:100vw !important;}
+#rotateRoot[data-rotated="1"] main{min-height:0;}
 /* Unread dot for nav tabs (Mail) — high-contrast on e-ink */
 nav .tab.has-unread{position:relative;}
 nav .tab.has-unread::after{content:'';position:absolute;top:7px;right:2px;width:7px;height:7px;border-radius:50%;background:var(--fg);}
@@ -1006,8 +1012,10 @@ body.launcher-ui .view{padding-bottom:80px;}
       <div class="header-sub" id="mainHeaderSub" title="Click to verify fresh load — should say v8.1.0">v8.1.0</div>
     </div>
     <div class="header-controls">
+      <button class="btn small" id="recentBtn" title="Recent activities — jump back to a page you were on">Recent</button>
       <div class="clock" id="sysClock"></div>
       <button class="btn small" id="legacyModeBtn" title="View original KindleHub (August special)" style="display:none;border-color:var(--muted);color:var(--muted)">v1 Preview</button>
+      <button class="btn small" id="landscapeBtn" title="Rotate the app 90° for sideways reading">Landscape</button>
       <button class="btn small" id="themeBtn" title="Cycle theme: Light / Dark / Sepia">Light</button>
       <button class="btn small" id="uiModeBtn" title="Cycle home layout: Classic / Launcher / Retro">Classic</button>
       <button class="btn small" id="desktopLaunchBtn" title="Launch KindleOS" onclick="launchKindleDesktop()">KindleOS</button>
@@ -1086,6 +1094,7 @@ body.launcher-ui .view{padding-bottom:80px;}
     <div class="tab" data-view="wikipedia" style="display:none">Wikipedia</div>
     <div class="tab" data-view="cookbook">Cookbook</div>
     <div class="tab" data-view="files">Files</div>
+    <div class="tab" data-view="gallery">Gallery</div>
     <div class="tab" data-view="mail">Mail</div>
     <div class="tab nav-essential" data-view="settings">Settings</div>
   </nav>
@@ -1971,7 +1980,7 @@ const NAV_TABS=[
   ['notes','Notes'],['slides','Slides'],['sheets','Sheets'],['starmap','Stars'],['browser','Browser'],
   ['periodic','Elements'],['formulas','Formulas'],['science','Science'],
   ['sleeplog','Sleep'],['qrgen','QR Code'],
-  ['wikipedia','Wikipedia'],['cookbook','Cookbook'],['files','Files'],['mail','Mail']
+  ['wikipedia','Wikipedia'],['cookbook','Cookbook'],['files','Files'],['gallery','Gallery'],['mail','Mail']
 ];
 function getNavOrder(){
   /* Return saved order, but always include any NAV_TABS missing from it
@@ -2032,6 +2041,10 @@ function setNavTabVisible(view,visible){
 
 const $=id=>document.getElementById(id);
 const qs=(s,p)=>(p||document).querySelector(s);
+/* Shared input debouncer — full list re-renders on EVERY keystroke are the
+   single biggest cause of laggy typing on e-ink. Wrap the handler once and
+   the rebuild runs when the user pauses instead of per letter. */
+function khDebounce(fn,ms){let t=null;return function(){const a=arguments,s=this;if(t)clearTimeout(t);t=setTimeout(()=>{t=null;fn.apply(s,a);},ms||180);};}
 /* On-demand vendor script loader. The export libraries (pptxgenjs,
    jspdf, pdfjs) total ~1.5 MB — far too heavy to download on every
    boot of a Kindle that may never open the Slides tab. They are now
@@ -2215,7 +2228,7 @@ function khOpenSelect(sel,trigger){
     };
     return row;
   }
-  if(searchInp){searchInp.addEventListener('input',()=>renderOpts(searchInp.value));}
+  if(searchInp){searchInp.addEventListener('input',khDebounce(()=>renderOpts(searchInp.value),180));}
   renderOpts('');
 
   overlay.appendChild(panel);
@@ -3616,7 +3629,7 @@ function launchKindleDesktop(){
       if(!t){ov.remove();return;}
       if(!S.notes)S.notes=[];
       const tags=[...t.matchAll(/#(\w+)/g)].map(m=>m[1]);
-      S.notes.unshift({id:Date.now(),text:t,tags,date:new Date().toISOString(),pinned:false});
+      S.notes.unshift({id:Date.now()+'_'+Math.random().toString(36).slice(2,6),text:t,tags,date:new Date().toISOString(),pinned:false});
       saveNow();
       ov.remove();
       toast('Note saved.',1400);
@@ -4603,10 +4616,26 @@ const KH_FONTS={system:['System',"-apple-system,BlinkMacSystemFont,'Segoe UI',Ro
 function _contrastColor(hex){try{var h=String(hex).replace('#','');if(h.length===3)h=h.split('').map(function(c){return c+c;}).join('');var r=parseInt(h.slice(0,2),16),g=parseInt(h.slice(2,4),16),b=parseInt(h.slice(4,6),16);return (0.299*r+0.587*g+0.114*b)>140?'#111111':'#ffffff';}catch(_){return '#ffffff';}}
 function applyCustomisation(){
   try{
-    var root=document.documentElement;
-    if(S.accent){root.style.setProperty('--accent',S.accent);root.style.setProperty('--accent-inv',_contrastColor(S.accent));}
-    var f=S.uiFont&&KH_FONTS[S.uiFont];
-    if(f)root.style.setProperty('--ui-font',f[1]);
+    /* Set the vars on BOTH <html> and <body>. The dark/sepia theme classes
+       (body.dark{--accent:…}) live on <body>, and custom properties resolve
+       from the nearest ancestor — so an inline override on <html> alone was
+       beaten by the theme for everything on the page. That is why accent
+       "did nothing" outside light mode. Inline-on-body outranks the class. */
+    var targets=[document.documentElement,document.body].filter(Boolean);
+    targets.forEach(function(t){
+      if(S.accent){t.style.setProperty('--accent',S.accent);t.style.setProperty('--accent-inv',_contrastColor(S.accent));}
+      else{t.style.removeProperty('--accent');t.style.removeProperty('--accent-inv');}
+      var f=S.uiFont&&KH_FONTS[S.uiFont];
+      if(f){
+        t.style.setProperty('--ui-font',f[1]);
+        /* Also drive the CONTENT font — --ui-font only covers buttons and
+           labels, and its default equals the "System" choice, so changing
+           the font looked like a no-op. Body text follows --body-font. */
+        t.style.setProperty('--body-font',f[1]);
+      }else{
+        t.style.removeProperty('--ui-font');t.style.removeProperty('--body-font');
+      }
+    });
     if(typeof _applyLang==='function')_applyLang();
   }catch(_){}
 }
@@ -4876,6 +4905,74 @@ $('uiModeBtn').onclick=()=>{
   }
   toast('UI mode: '+_uiModeLabel(next),1500);
 };
+
+/* ── Landscape mode (v2 — clean rebuild) ─────────────────────────────────
+   Rotates #rotateRoot 90° so a Kindle held sideways gets a widescreen
+   layout. Deliberately minimal compared with v1: one transform, one CSS
+   height clamp (#app must size against 100vw, the rotated viewport's
+   height), keyboard re-parent, and a resize re-apply. No per-view CSS
+   forks — that sprawl is what made v1 unmaintainable. KindleOS (which
+   mounts outside #rotateRoot) stays portrait by design. */
+function toggleLandscape(forceTo){
+  const rr=$('rotateRoot');if(!rr)return;
+  const isRot=rr.getAttribute('data-rotated')==='1';
+  const go=(forceTo!==undefined)?!!forceTo:!isRot;
+  const btn=$('landscapeBtn');
+  if(!go){
+    rr.removeAttribute('data-rotated');
+    rr.style.cssText='width:100%;height:100%;position:relative;';
+    document.body.style.overflow='';
+    if(btn){btn.textContent='Landscape';btn.classList.remove('primary');}
+    S.landscapeMode=false;
+  }else{
+    const pw=window.innerWidth,ph=window.innerHeight;
+    window._lsW=pw;window._lsH=ph;/* lets the resize handler tell a real viewport change from our own synthetic resize event */
+    rr.setAttribute('data-rotated','1');
+    rr.style.cssText=['position:fixed','top:0','left:0','width:'+ph+'px','height:'+pw+'px',
+      'transform-origin:top left','transform:rotate(90deg) translateY(-'+pw+'px)',
+      'overflow:hidden','background:var(--bg)'].join(';');
+    document.body.style.overflow='hidden';
+    if(btn){btn.textContent='Portrait';btn.classList.add('primary');}
+    S.landscapeMode=true;
+  }
+  save();
+  /* Keyboard mounts inside rotateRoot — ask it to re-seat itself. */
+  try{if(window._khKeyboard&&window._khKeyboard.relocate)window._khKeyboard.relocate();}catch(_){}
+  /* Canvases/grids re-measure against the rotated viewport. */
+  try{window.dispatchEvent(new Event('resize'));}catch(_){}
+}
+(function(){
+  const b=$('landscapeBtn');if(b)b.onclick=()=>toggleLandscape();
+  /* Recent-activities quick switcher — a lightweight "open tabs" panel. */
+  const _rb=$('recentBtn');
+  if(_rb)_rb.onclick=()=>{
+    const rv=(window._khRecentViews||[]).filter(x=>x!==currentView);
+    const ov=el('div',{style:{position:'fixed',top:'0',left:'0',right:'0',bottom:'0',background:'rgba(0,0,0,0.5)',zIndex:'600200',display:'flex',alignItems:'flex-start',justifyContent:'center',padding:'60px 16px 16px'}});
+    const box=el('div',{style:{background:'var(--card)',border:'var(--border)',borderRadius:'12px',padding:'14px',width:'100%',maxWidth:'420px',boxShadow:'var(--shadow-md)'}});
+    box.appendChild(txt('h3','Recent activities',{style:{margin:'0 0 10px',fontFamily:'var(--title-font)'}}));
+    if(!rv.length)box.appendChild(txt('p','No other activities yet — open a few pages and they\'ll show here so you can jump back.',{style:{fontSize:'12px',color:'var(--muted)',lineHeight:'1.5'}}));
+    const labelOf=v=>{const m=(typeof NAV_TABS!=='undefined'?NAV_TABS:[]).find(t=>t[0]===v);return m?m[1]:(v==='home'?'Home':v==='settings'?'Settings':v.charAt(0).toUpperCase()+v.slice(1));};
+    const grid=el('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(110px,1fr))',gap:'6px'}});
+    rv.forEach(v=>{const bb=txt('button',labelOf(v),{className:'btn small',style:{textAlign:'left'}});bb.onclick=()=>{ov.remove();const t=document.querySelector('nav .tab[data-view="'+v+'"]');if(t)t.click();else showView(v);};grid.appendChild(bb);});
+    box.appendChild(grid);
+    const cl=txt('button','Close',{className:'btn small',style:{marginTop:'12px'}});cl.onclick=()=>ov.remove();box.appendChild(cl);
+    ov.onclick=e=>{if(e.target===ov)ov.remove();};
+    ov.appendChild(box);document.body.appendChild(ov);
+  };
+  if(S.landscapeMode)setTimeout(()=>toggleLandscape(true),120);
+  /* Keep geometry correct if the viewport itself changes while rotated
+     (soft keyboard, browser chrome). Re-apply with fresh dimensions. */
+  let _lsT=null;
+  window.addEventListener('resize',()=>{
+    const rr=$('rotateRoot');
+    if(!rr||rr.getAttribute('data-rotated')!=='1')return;
+    /* Our own toggle dispatches a synthetic resize — without this check it
+       would re-trigger itself forever. Only re-apply on a REAL change. */
+    if(window.innerWidth===window._lsW&&window.innerHeight===window._lsH)return;
+    if(_lsT)clearTimeout(_lsT);
+    _lsT=setTimeout(()=>{if(S.landscapeMode)toggleLandscape(true);},250);
+  });
+})();
 
 function applyFontSize(size){
   const sz=(size||16);
@@ -5508,6 +5605,41 @@ $('hideApiBar').onclick=()=>{ $('apiKeyBar').style.display='none'; };
       create trigger kh_messages_cap
         after insert on kh_messages
         for each row execute function kh_messages_cap_trigger();
+
+      -- v8.3 STORAGE GUARD: cap kh_mail (60 newest per recipient) so the
+      -- mailbox table can't grow without bound as the userbase grows.
+      create or replace function kh_mail_cap_trigger()
+        returns trigger language plpgsql security definer as $body$
+      begin
+        delete from kh_mail
+          where to_user = new.to_user
+            and id not in (
+              select id from kh_mail where to_user = new.to_user
+              order by ts desc limit 60
+            );
+        return null;
+      end;
+      $body$;
+      drop trigger if exists kh_mail_cap on kh_mail;
+      create trigger kh_mail_cap
+        after insert on kh_mail
+        for each row execute function kh_mail_cap_trigger();
+
+      -- v8.3 STORAGE GUARD: cap kh_errors at ~600 newest rows globally.
+      create or replace function kh_errors_cap_trigger()
+        returns trigger language plpgsql security definer as $body$
+      begin
+        if (random() < 0.05) then
+          delete from kh_errors
+            where id not in (select id from kh_errors order by date desc limit 600);
+        end if;
+        return null;
+      end;
+      $body$;
+      drop trigger if exists kh_errors_cap on kh_errors;
+      create trigger kh_errors_cap
+        after insert on kh_errors
+        for each row execute function kh_errors_cap_trigger();
 
       -- Also rate-limit feedback submissions globally (anti-spam)
       create or replace function kh_feedback_rate_trigger()
@@ -7913,6 +8045,10 @@ function _refreshStorageUI(){
 async function _saveUser(key,email,stateObj){
   const encKey=S._encKey||key;
   const packed=await _encryptState(encKey,_trimStateForCloud(stateObj));
+  /* Mirror the encrypted blob into the on-device offline-login cache so the
+     account stays usable with no network. Runs on every save/sync, so the
+     cached copy is always current. */
+  try{_cacheOfflineCred(key,email,packed);}catch(_){}
   if(_sbActive()){
     /* Upsert on hash; if email/state changed we update; otherwise insert */
     await _sbUpsert('kh_users',{hash:key,email,state:packed,updated_at:new Date().toISOString()},'hash');
@@ -8125,6 +8261,26 @@ function _loginNoteFailure(name){
   try{localStorage.setItem(_loginFailKey(name),JSON.stringify(s));}catch(_){}
 }
 function _loginClearFailures(name){try{localStorage.removeItem(_loginFailKey(name));}catch(_){}}
+/* ── Offline login cache ───────────────────────────────────────────────
+   Stores each account's encrypted state blob on THIS device, keyed by its
+   auth hash, so a user can sign in (and out, then back in) with no network.
+   The blob is the same AES-GCM ciphertext the cloud holds — useless without
+   the password (which alone derives the key), so it's safe at rest. Kept to
+   the 3 most-recent accounts. */
+function _cacheOfflineCred(key,email,packed){
+  try{
+    if(!key||typeof packed!=='string'||!packed)return;
+    let store={};try{store=JSON.parse(localStorage.getItem('kh_offline_cred')||'{}');}catch(_){store={};}
+    store[key]={email:email||'',packed:packed,at:Date.now()};
+    const ks=Object.keys(store);
+    if(ks.length>3){ks.sort((a,b)=>(store[a].at||0)-(store[b].at||0));while(Object.keys(store).length>3)delete store[ks.shift()];}
+    localStorage.setItem('kh_offline_cred',JSON.stringify(store));
+    if(email)localStorage.setItem('kh_last_user',email);
+  }catch(_){}
+}
+function _offlineCred(key){
+  try{const store=JSON.parse(localStorage.getItem('kh_offline_cred')||'{}');return store[key]||null;}catch(_){return null;}
+}
 
 async function authRegister(email,password){
   try{
@@ -8203,12 +8359,27 @@ async function authLogin(email,password){
         }
       }catch(e){console.warn('Legacy login lookup failed',e);}
     }
+    /* OFFLINE LOGIN: the server lookups returned nothing — usually no
+       network. If THIS device cached an encrypted copy for this exact key
+       (from a prior successful sign-in here), use it so the user can still
+       get in. The password still has to decrypt it, so it's not a bypass. */
+    let _offline=false;
     if(!packed){
-      return{success:false,error:'No account found. Check email/password or register first.'};
+      const cred=_offlineCred(key);
+      if(cred&&cred.packed){packed=cred.packed;_offline=true;}
+    }
+    if(!packed){
+      return{success:false,error:(navigator&&navigator.onLine===false)
+        ?'You’re offline and this device has no saved copy of that account. Connect to Wi-Fi to sign in the first time.'
+        :'No account found. Check email/password or register first.'};
     }
     const cloudState=await _decryptState(key,packed);
     if(!cloudState)return{success:false,error:'Decryption failed — wrong password?'};
     S.userId=key.slice(0,16);S.authToken=key;S.email=email;S.syncEnabled=true;S._encKey=key;
+    /* Refresh the offline cache for this device (and remember the username
+       for the login form) even when we signed in from the server. */
+    try{_cacheOfflineCred(key,email,packed);}catch(_){}
+    if(_offline&&typeof toast==='function')toast('Signed in offline — your data syncs when you reconnect.',3500);
     if(cloudState&&Object.keys(cloudState).length>0)mergeCloudState(cloudState);
     if(needsMigration){
       /* Move the user record over to Supabase (or refresh the legacy entry) */
@@ -8334,13 +8505,12 @@ async function _khFetchScores(game,limit){
     if(typeof _khLoadBanned==='function'){try{await _khLoadBanned(false);}catch(_){}}
     const rows=await _sbSelect('kh_scores','game=eq.'+encodeURIComponent(game)+'&order=score.desc&limit='+limit+'&select=score,display_name,date');
     if(!Array.isArray(rows))return[];
-    /* Mask admin-banned usernames everywhere scores are shown (leaderboards,
-       best-score badge, admin stats) — a single chokepoint so no render
-       site can leak a banned name. */
-    if(typeof _dispName==='function'){
-      rows.forEach(r=>{if(r&&r.display_name)r.display_name=_dispName(r.display_name);});
-    }
-    return rows;
+    /* Banned users are REMOVED from every score list entirely (not just
+       masked as '[removed]') — one chokepoint covers leaderboards, the
+       best-score badge and admin stats. */
+    let out=rows;
+    if(typeof _khIsBannedSync==='function')out=rows.filter(r=>!(r&&r.display_name&&_khIsBannedSync(r.display_name)));
+    return out;
   }catch(e){console.warn('Fetch scores failed',e&&e.message);return[];}
 }
 
@@ -8619,21 +8789,58 @@ async function _groupFetchMessages(code){
    and costs zero extra requests. */
 const KH_MAIL_DOMAIN='kindlehub.pro';
 function _mailNorm(u){return String(u||'').trim().toLowerCase().replace(/@.*$/,'').slice(0,40);}
+/* External = a full address at any OTHER domain (alice@gmail.com). Internal
+   = a bare username or username@kindlehub.pro. */
+function _mailIsExternal(addr){
+  const a=String(addr||'').trim().toLowerCase();
+  if(!a.includes('@'))return false;
+  return !a.endsWith('@'+KH_MAIL_DOMAIN);
+}
+/* Outbound gateway for REAL internet email — a Cloudflare Worker (see
+   email-worker.js in the repo) that fronts an email API and also receives
+   inbound mail for @kindlehub.pro via Email Routing. The URL is set once
+   by the admin; empty = external sending disabled with a clear message. */
+function _mailGatewayUrl(){
+  try{const o=(localStorage.getItem('kh_mail_gateway')||'').trim();if(o)return o.replace(/\/+$/,'');}catch(_){}
+  return '';
+}
 function _myMailUser(){return _mailNorm(S.email||'');}
 function _mailState(){if(!S.mailState||typeof S.mailState!=='object')S.mailState={};return S.mailState;}
 async function _mailSend(toUser,subject,body,replyTo){
   if(!_sbActive())throw new Error('Mail needs the cloud backend — check your connection.');
-  const to=_mailNorm(toUser);
-  if(!to)throw new Error('Enter a recipient username.');
-  /* Tiny existence check so typos bounce immediately instead of vanishing. */
-  const hit=await _sbSelect('kh_users','email=eq.'+encodeURIComponent(to)+'&select=email&limit=1');
-  if(!Array.isArray(hit)||!hit.length)throw new Error('No KindleHub account called "'+to+'" — check the address.');
+  const external=_mailIsExternal(toUser);
+  const to=external?String(toUser).trim().toLowerCase().slice(0,120):_mailNorm(toUser);
+  if(!to)throw new Error('Enter a recipient.');
+  if(external){
+    /* Real internet email — relayed through the Cloudflare Worker gateway,
+       which sends from username@kindlehub.pro via the email API. */
+    const gw=_mailGatewayUrl();
+    if(!gw)throw new Error('Sending to outside addresses isn\'t switched on yet for this KindleHub — the admin needs to deploy the mail gateway (email-worker.js).');
+    if(!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(to))throw new Error('"'+to+'" doesn\'t look like a valid email address.');
+    const r=await fetch(gw+'/send',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({to:to,from_user:_myMailUser(),subject:String(subject||'(no subject)').slice(0,160),body:String(body||'').slice(0,8000)})});
+    if(!r.ok){let t='';try{t=(await r.json()).error||'';}catch(_){}throw new Error(t||('Gateway error '+r.status+' — mail not sent.'));}
+  }else{
+    /* Tiny existence check so typos bounce immediately instead of vanishing. */
+    const hit=await _sbSelect('kh_users','email=eq.'+encodeURIComponent(to)+'&select=email&limit=1');
+    if(!Array.isArray(hit)||!hit.length)throw new Error('No KindleHub account called "'+to+'" — for outside addresses include the full domain (e.g. name@gmail.com).');
+  }
+  /* One kh_mail row either way: the recipient's copy for internal mail, or
+     OUR Sent-folder copy for external (to_user holds the full address, which
+     also keys the encryption — _mailFetch derives the same key back). */
   const id='m_'+Date.now().toString(36)+Math.random().toString(36).slice(2,7);
   const secret=(typeof _newSecret==='function')?_newSecret():(String(Math.random()).slice(2)+Date.now());
   const encSubject=await _msgEncrypt('mail:'+to,String(subject||'(no subject)').slice(0,160));
   const encBody=await _msgEncrypt('mail:'+to,String(body||'').slice(0,8000));
   await _sbInsert('kh_mail',[{id,to_user:to,from_user:_myMailUser(),from_id:S.userId||'',subject:encSubject,body:encBody,ts:new Date().toISOString(),reply_to:String(replyTo||''),owner_secret:secret}]);
-  try{if(!S.msgSecrets)S.msgSecrets={};S.msgSecrets[id]=secret;save();}catch(_){}
+  try{if(!S.msgSecrets)S.msgSecrets={};S.msgSecrets[id]=secret;}catch(_){}
+  /* Remember the recipient for the compose modal's one-tap chips
+     (most-recent first, deduped, capped). */
+  try{
+    const list=Array.isArray(S.mailContacts)?S.mailContacts:[];
+    S.mailContacts=[to].concat(list.filter(c=>c!==to)).slice(0,12);
+  }catch(_){}
+  save();
   return id;
 }
 async function _mailFetch(folder){
@@ -10340,7 +10547,7 @@ function openCrosswordCatalogue(){
     });
   }
   renderList();
-  searchInput.addEventListener('input',renderList);
+  searchInput.addEventListener('input',khDebounce(renderList,180));
 }
 
 /* ── Crossword game engine ─────────────────────────────────── */
@@ -10669,6 +10876,14 @@ const ALWAYS_REBUILD=new Set(['games','messages','pet']);
 
 function showView(id){
   currentView=id;
+  /* Recent-activities tracker for the header quick-switcher ("minimise a
+     tab and jump back" request). Keeps the last few DISTINCT views. */
+  try{
+    if(!window._khRecentViews)window._khRecentViews=[];
+    const rv=window._khRecentViews;
+    const at=rv.indexOf(id);if(at>=0)rv.splice(at,1);
+    rv.unshift(id);if(rv.length>8)rv.length=8;
+  }catch(_){}
   while(mainHost.firstChild)mainHost.removeChild(mainHost.firstChild);
   if(ALWAYS_REBUILD.has(id))delete VIEWS[id];
   if(!VIEWS[id]){
@@ -11410,7 +11625,14 @@ const Blackjack=(function(){
   function draw(){if(!deck.length)newDeck();return deck.pop();}
   function val(hand){let t=0,a=0;hand.forEach(c=>{if(c.r==='A'){a++;t+=11;}else if(c.r==='K'||c.r==='Q'||c.r==='J'||c.r==='10')t+=10;else t+=parseInt(c.r,10);});while(t>21&&a){t-=10;a--;}return t;}
   function deal(){
-    if(chips<bet)chips=100;
+    /* Out of chips → a fresh 100-chip buy-in. CLAMP the bet to what's
+       actually available first: an all-in bet carried over from a richer
+       round used to exceed the 100 rebuy, so chips-=bet went NEGATIVE (the
+       'go all-in twice → negative, then win everything +100' bug). */
+    if(chips<bet){
+      if(chips<5){chips=100;if(typeof toast==='function')toast('Out of chips — fresh 100-chip buy-in.',2200);}
+      bet=Math.max(5,Math.min(bet,chips));
+    }
     chips-=bet;newDeck();phand=[draw(),draw()];dhand=[draw(),draw()];msg='';
     if(val(phand)===21){phase='over';settle();}else phase='player';
     render();
@@ -11457,7 +11679,7 @@ const Blackjack=(function(){
     }else{
       const minus=txt('button','– bet',{className:'btn small'});minus.onclick=()=>{bet=Math.max(5,bet-5);render();};
       const dealB=txt('button','Deal ('+bet+')',{className:'btn small primary'});dealB.onclick=deal;
-      const plus=txt('button','+ bet',{className:'btn small'});plus.onclick=()=>{bet=Math.min(Math.max(5,chips||100),bet+5);render();};
+      const plus=txt('button','+ bet',{className:'btn small'});plus.onclick=()=>{bet=Math.min(Math.max(5,chips),bet+5);render();};
       ctr.append(minus,dealB,plus);
     }
     wrap.appendChild(ctr);
@@ -11801,6 +12023,17 @@ const CrazyEights=(function(){
    is up, so this works even when accepted cold from the invite banner. */
 (window._khGameAcceptors=window._khGameAcceptors||{}).crazy8=function(session,fromName){try{CrazyEights.startOnline(session);}catch(e){}};
 
+/* Wrap a game's "New Game" button so it asks before discarding a game that
+   is still in progress. activeFn() returns true while a round is live; when
+   it's already over the new game starts immediately (no nag on replay).
+   kindleConfirm centres correctly on old Kindle WebKit. */
+function newGameGuard(activeFn,startFn){
+  return function(){
+    let active=false;try{active=!!(activeFn&&activeFn());}catch(_){}
+    if(active){kindleConfirm('Start a new game? Your current game will be lost.',function(ok){if(ok){try{startFn();}catch(_){}}});}
+    else{try{startFn();}catch(_){}}
+  };
+}
 function launchGame(g){
   window._currentGame=g;
   S.lastPlay={game:g,at:NOW().toISOString()};save();updateLastPlayUI();
@@ -12559,7 +12792,7 @@ const Connect4=(()=>{
 
     board.onclick=e=>{const cc=e.target.closest('.cf-cell');if(cc)drop(parseInt(cc.dataset.col));};
     const ctrl=el('div',{className:'card-row',style:'margin-top:10px;justify-content:center;'});
-    ctrl.appendChild(Object.assign(txt('button','New Game',{className:'btn'}),{onclick:start}));
+    ctrl.appendChild(Object.assign(txt('button','New Game',{className:'btn'}),{onclick:newGameGuard(()=>C&&C.active,start)}));
     immersiveContent.appendChild(ctrl);
   }
 
@@ -14596,7 +14829,7 @@ const Chess=(()=>{
 
     /* Controls */
     const ctrl=el('div',{className:'card-row',style:'justify-content:center;flex-wrap:wrap;'});
-    ctrl.appendChild(Object.assign(txt('button','New',{className:'btn small'}),{onclick:start}));
+    ctrl.appendChild(Object.assign(txt('button','New',{className:'btn small'}),{onclick:newGameGuard(()=>!gameOver&&moveHistory&&moveHistory.length>0,start)}));
     ctrl.appendChild(Object.assign(txt('button','Undo',{className:'btn small'}),{onclick:undoMove}));
     /* Board flip — useful when playing as black online, or when
        sharing a Kindle face-to-face and want to swap perspectives. */
@@ -14969,7 +15202,7 @@ const Minesweeper=(()=>{
     grid.onclick=e=>{const c=e.target.closest('.ms-cell');if(c)reveal(parseInt(c.dataset.idx));};
     grid.oncontextmenu=e=>{e.preventDefault();const c=e.target.closest('.ms-cell');if(c){const idx=parseInt(c.dataset.idx);if(!ms.revealed[idx]){ms.flagged[idx]=!ms.flagged[idx];render();}}};
     const ctrl=el('div',{className:'card-row',style:{marginTop:'10px'}});
-    ctrl.appendChild(Object.assign(txt('button','New',{className:'btn'}),{onclick:start}));
+    ctrl.appendChild(Object.assign(txt('button','New',{className:'btn'}),{onclick:newGameGuard(()=>ms&&ms.active,start)}));
     immersiveContent.appendChild(ctrl);
   }
   function reveal(i){
@@ -15221,11 +15454,35 @@ const Sudoku=(()=>{
     clrBtn.onclick=()=>{if(selected&&!G.fixed[selected[0]][selected[1]]){G.user[selected[0]][selected[1]]=0;render();}};
     numpad.appendChild(clrBtn);
     immersiveContent.appendChild(numpad);
-    const ctrl=el('div',{className:'card-row',style:{marginTop:'8px'}});
-    ctrl.appendChild(Object.assign(txt('button','New',{className:'btn'}),{onclick:start}));
+    const ctrl=el('div',{className:'card-row',style:{marginTop:'8px',flexWrap:'wrap'}});
+    ctrl.appendChild(Object.assign(txt('button','New',{className:'btn'}),{onclick:newGameGuard(()=>G&&G.user&&G.user.some(row=>row.some(Boolean)),start)}));
     const revBtn=txt('button','Reveal Cell',{className:'btn small'});
     revBtn.onclick=()=>{if(!selected||G.fixed[selected[0]][selected[1]])return;G.user[selected[0]][selected[1]]=G.solution[selected[0]][selected[1]];render();toast('Cell revealed');};
     ctrl.appendChild(revBtn);
+    /* ── Team Sudoku ── share the exact puzzle so friends solve the same
+       board and race. The code is just the 81 givens; the loader re-solves
+       it for validation. (Community request: "team sudoku".) */
+    const shareBtn=txt('button','Share puzzle',{className:'btn small'});
+    shareBtn.onclick=()=>{
+      if(!G)return;
+      const code=G.puzzle.map(row=>row.map(v=>v||0).join('')).join('');
+      if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(code).then(()=>toast('Puzzle code copied — share it and race a friend!',3000),()=>kindlePrompt('Copy this puzzle code:',code,()=>{}));
+      else kindlePrompt('Copy this puzzle code to share:',code,()=>{});
+    };
+    const loadBtn=txt('button','Load shared',{className:'btn small'});
+    loadBtn.onclick=()=>{
+      kindlePrompt('Paste a shared Sudoku code (81 digits):','',function(code){
+        const clean=String(code||'').replace(/[^0-9]/g,'');
+        if(clean.length!==81){toast('That code isn\'t a valid puzzle (need 81 digits).',3000);return;}
+        const puzzle=[];for(let r=0;r<9;r++){const row=[];for(let c=0;c<9;c++)row.push(parseInt(clean[r*9+c],10));puzzle.push(row);}
+        const sol=puzzle.map(r=>[...r]);
+        if(!solve(sol)){toast('That puzzle has no valid solution — check the code.',3500);return;}
+        G={puzzle:puzzle.map(r=>[...r]),solution:sol,user:Array.from({length:9},()=>Array(9).fill(0)),fixed:puzzle.map(r=>r.map(v=>v!==0)),errors:0,diff:'shared',startTime:Date.now()};
+        selected=null;enterImmersive('Sudoku','shared puzzle');render();
+        toast('Shared puzzle loaded — good luck!',2500);
+      });
+    };
+    ctrl.appendChild(shareBtn);ctrl.appendChild(loadBtn);
     immersiveContent.appendChild(ctrl);
   }
   /* Sudoku boards are never persisted mid-game, so there is nothing
@@ -15320,7 +15577,7 @@ const Snake=(()=>{
     dpad.appendChild(rB);dpad.appendChild(el('div'));dpad.appendChild(el('div'));dpad.appendChild(el('div'));
     immersiveContent.appendChild(dpad);
     const ctrl=el('div',{className:'card-row',style:{marginTop:'6px',justifyContent:'center'}});
-    ctrl.appendChild(Object.assign(txt('button','New Game',{className:'btn small'}),{onclick:start}));
+    ctrl.appendChild(Object.assign(txt('button','New Game',{className:'btn small'}),{onclick:newGameGuard(()=>game&&game.active,start)}));
     immersiveContent.appendChild(ctrl);
     if(timer)clearInterval(timer);
     timer=setInterval(tick,speed);
@@ -15491,7 +15748,7 @@ const G2048=(()=>{
     const ctrl=el('div',{className:'card-row',style:{marginTop:'20px',justifyContent:'center'}});
     const ngBtn=txt('button','New Game',{className:'btn small'});
     ngBtn.style.minWidth='110px';
-    ngBtn.onclick=start;
+    ngBtn.onclick=newGameGuard(()=>G&&G.active,start);
     ctrl.appendChild(ngBtn);
     immersiveContent.appendChild(ctrl);
   }
@@ -18419,7 +18676,7 @@ function _initRacer(){ if(Racer)return; Racer=(()=>{
     const autoBtn=txt('button',G.auto?'Auto: ON':'Auto-accelerate',{className:'btn small'+(G.auto?' primary':'')});
     autoBtn.onclick=()=>{G.auto=!G.auto;autoBtn.textContent=G.auto?'Auto: ON':'Auto-accelerate';autoBtn.classList.toggle('primary',G.auto);toast(G.auto?'Auto-accelerate on — just steer!':'Auto-accelerate off',1600);};
     ctrl.appendChild(autoBtn);
-    ctrl.appendChild(Object.assign(txt('button','New Game',{className:'btn small'}),{onclick:start}));
+    ctrl.appendChild(Object.assign(txt('button','New Game',{className:'btn small'}),{onclick:newGameGuard(()=>G&&G.active,start)}));
     immersiveContent.appendChild(ctrl);
     if(timer)clearInterval(timer);
     lastT=Date.now();
@@ -20470,6 +20727,28 @@ function _initFlightSim(){
     title.style.cssText='font-size:13px;font-weight:900;text-transform:uppercase;letter-spacing:1px;text-align:center;padding:6px 0 10px;border-bottom:1px solid var(--fg);margin-bottom:8px;';
     title.textContent='FLIGHT SIM — SELECT MODE';
     immersiveContent.appendChild(title);
+
+    /* ── How to fly (community asked for clearer instructions) ── */
+    const helpBtn=document.createElement('button');helpBtn.className='btn small';
+    helpBtn.textContent='✈ How to fly (read first)';
+    helpBtn.style.cssText='width:100%;margin-bottom:8px;font-weight:700;';
+    helpBtn.onclick=()=>{
+      const ov=document.createElement('div');
+      ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,0.85);z-index:600300;display:flex;align-items:center;justify-content:center;padding:16px;';
+      const box=document.createElement('div');
+      box.style.cssText='background:var(--card);color:var(--fg);border-radius:12px;padding:16px 18px;max-width:420px;max-height:88vh;overflow-y:auto;font-size:13px;line-height:1.6;box-shadow:var(--shadow-md);';
+      box.innerHTML='<h3 style="margin:0 0 10px;font-family:var(--title-font);">How to fly</h3>'+
+        '<p style="margin:0 0 8px;"><b>Goal:</b> take off, fly to an airport, and land gently on the runway.</p>'+
+        '<p style="margin:0 0 8px;"><b>1. Take off:</b> tap <b>MAX THR</b> (full throttle). When your speed passes the rotate speed (about 55kt in the Cessna), hold <b>NOSE UP</b> until you climb.</p>'+
+        '<p style="margin:0 0 8px;"><b>2. Climb &amp; cruise:</b> ease off the nose so the climb is steady. Keep the wings level with the <b>◄ ►</b> bank buttons. Watch your altitude (ALT) and speed (KT) on the instrument bar.</p>'+
+        '<p style="margin:0 0 8px;"><b>3. Navigate:</b> open <b>MAP</b>, tap to drop a waypoint to an airport. The heading bug points the way.</p>'+
+        '<p style="margin:0 0 8px;"><b>4. Land:</b> line up with the runway, lower <b>GEAR</b> and <b>FLAPS</b>, reduce throttle, and descend slowly. Touch down near stall speed with the nose slightly up. Too fast or too steep = crash.</p>'+
+        '<p style="margin:0 0 4px;color:var(--muted);font-size:12px;"><b>Tip:</b> the Cessna 172 is the most forgiving — start there. Buttons that stay lit are <b>held</b>; tap again to release.</p>';
+      const cl=document.createElement('button');cl.className='btn small primary';cl.textContent='Got it';cl.style.marginTop='10px';cl.onclick=()=>ov.remove();
+      box.appendChild(cl);ov.onclick=e=>{if(e.target===ov)ov.remove();};
+      ov.appendChild(box);document.body.appendChild(ov);
+    };
+    immersiveContent.appendChild(helpBtn);
 
     /* ── Aircraft selector ── */
     const acTitle=document.createElement('div');
@@ -22590,7 +22869,7 @@ function renderQuizSaveCard(quiz,container){
   const saveBtn=txt('button','Save',{className:'btn small primary',style:{fontSize:'11px',padding:'5px 12px',minHeight:'28px',flex:'1'}});
   saveBtn.onclick=()=>{
     if(!S.savedQuizzes)S.savedQuizzes=[];
-    S.savedQuizzes.unshift({...quiz,id:Date.now(),saved:new Date().toISOString()});
+    S.savedQuizzes.unshift({...quiz,id:Date.now()+'_'+Math.random().toString(36).slice(2,6),saved:new Date().toISOString()});
     save();saveBtn.textContent='Saved!';saveBtn.disabled=true;
     refreshQuizList&&refreshQuizList();
     toast('Quiz saved: '+quiz.title);
@@ -22680,7 +22959,7 @@ const AI_TOOLS={
       const text=String(a.text||'').trim();if(!text)return null;
       if(!S.notes)S.notes=[];
       const tags=Array.isArray(a.tags)?a.tags.map(String):[...text.matchAll(/#(\w+)/g)].map(m=>m[1]);
-      S.notes.unshift({id:Date.now(),text,tags,date:new Date().toISOString(),pinned:false});
+      S.notes.unshift({id:Date.now()+'_'+Math.random().toString(36).slice(2,6),text,tags,date:new Date().toISOString(),pinned:false});
       if(typeof saveNow==='function')saveNow();
       if(typeof renderNotes==='function')renderNotes();
       return 'Saved note: "'+text.slice(0,80)+(text.length>80?'…':'')+'"';
@@ -22709,7 +22988,7 @@ const AI_TOOLS={
     run:a=>{
       const name=String(a.name||'').trim();if(!name)return null;
       let habits;try{habits=JSON.parse(localStorage.getItem('kh_habits')||'[]');}catch(_){habits=[];}
-      habits.push({name,emoji:String(a.emoji||'*'),id:Date.now(),log:{},created:new Date().toISOString()});
+      habits.push({name,emoji:String(a.emoji||'*'),id:Date.now()+'_'+Math.random().toString(36).slice(2,6),log:{},created:new Date().toISOString()});
       try{localStorage.setItem('kh_habits',JSON.stringify(habits));}catch(_){}
       return 'Added habit "'+name+'" to your tracker.';
     },
@@ -25369,7 +25648,7 @@ const KINDLEHUB_MANUAL=[
 "",
 "## KindleHub Mail — your @kindlehub.pro address",
 "",
-"Every signed-in user automatically has a mail address: their username followed by @kindlehub.pro. Open the Mail tab to use it like a normal inbox — Inbox, Sent, Archive and Trash folders, Compose, Reply, Forward, and Unsend for mail you sent. To write to someone you only need their KindleHub username. Mail is encrypted in transit and at rest, read/archive state syncs across your devices, and a dot appears on the Mail tab when something new arrives. It delivers between KindleHub accounts (it is not connected to outside email like Gmail — the Mail tab has launcher buttons for those).",
+"Every signed-in user automatically has a mail address: their username followed by @kindlehub.pro. Open the Mail tab to use it like a normal inbox — Inbox, Sent, Archive and Trash folders, Compose, Reply, Forward, and Unsend for mail you sent. To write to someone you only need their KindleHub username. Mail is encrypted in transit and at rest, read/archive state syncs across your devices, and a dot appears on the Mail tab when something new arrives. It delivers between KindleHub accounts out of the box, and once the admin deploys the mail gateway (email-worker.js) it becomes a full internet address: outside mail sent to username@kindlehub.pro lands in your inbox, and Compose accepts any address (e.g. name@gmail.com) — the suffix disappears as you type a full address. Sent internet mail shows in Sent with a Delete-copy option (a delivered email can't be recalled).",
 "",
 "## Messages — chat groups and history caps",
 "",
@@ -33067,60 +33346,6 @@ settings:()=>{
   /* Thin shim so card code can still reference the setTimeout block pattern */
   function _defer(fn){_qPush(fn);}
 
-  /* ── Header Tabs card ─────────────────────────────────────────
-     Mirrors the Setup Wizard's "Your tabs" step: a clean 2-column
-     button grid where each tab is one toggle. Active (visible) tabs
-     are the primary black-on-white button; hidden ones are the
-     outline variant. State is stored in S.navHidden so it stays in
-     sync with the wizard, the existing "Top Menu Pages" card, and
-     syncNavVisibility() — one source of truth for nav state. */
-  _defer(()=>{
-    const card=el('div',{className:'card',style:{gridColumn:'1/-1'}});
-    card.appendChild(txt('h2','Header Tabs'));
-    card.appendChild(txt('p','Tap a page to toggle it in the top menu. Hidden pages are still reachable from Home, search and direct links.',{style:{fontSize:'12px',color:'var(--muted)',marginBottom:'12px',lineHeight:'1.55'}}));
-    if(!S.navHidden)S.navHidden={};
-    /* Same layout as the wizard step (line ~39944): 2-column grid of
-       left-aligned small buttons. Auto-fit so it expands on wide
-       screens but doesn't squash on a Kindle. */
-    const grid=el('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(120px,1fr))',gap:'6px'}});
-    NAV_TABS.forEach(([view,label])=>{
-      const isOn=!S.navHidden[view];
-      const b=txt('button',label,{className:'btn small'+(isOn?' primary':''),style:{textAlign:'left',fontSize:'11px'}});
-      b.dataset.htView=view;
-      /* Home + Settings are always visible — disable their buttons */
-      const locked=(view==='home'||view==='settings');
-      if(locked){b.disabled=true;b.style.opacity='0.55';b.title=label+' is always visible';}
-      else b.onclick=()=>{
-        S.navHidden[view]=!S.navHidden[view];
-        b.classList.toggle('primary',!S.navHidden[view]);
-        save();
-        if(typeof syncNavVisibility==='function')syncNavVisibility();
-      };
-      grid.appendChild(b);
-    });
-    card.appendChild(grid);
-    /* Quick actions row */
-    const actions=el('div',{style:{display:'flex',gap:'6px',marginTop:'12px',flexWrap:'wrap'}});
-    const showAllBtn=txt('button','Show all',{className:'btn small'});
-    showAllBtn.onclick=()=>{
-      NAV_TABS.forEach(([view])=>{S.navHidden[view]=false;});
-      save();
-      if(typeof syncNavVisibility==='function')syncNavVisibility();
-      grid.querySelectorAll('button[data-ht-view]').forEach(b=>{if(!b.disabled)b.classList.add('primary');});
-      toast('All tabs visible');
-    };
-    const hideAllBtn=txt('button','Hide all (except Home & Settings)',{className:'btn small'});
-    hideAllBtn.onclick=()=>{
-      NAV_TABS.forEach(([view])=>{if(view!=='home'&&view!=='settings')S.navHidden[view]=true;});
-      save();
-      if(typeof syncNavVisibility==='function')syncNavVisibility();
-      grid.querySelectorAll('button[data-ht-view]').forEach(b=>{if(!b.disabled)b.classList.remove('primary');});
-      toast('All optional tabs hidden');
-    };
-    actions.appendChild(showAllBtn);actions.appendChild(hideAllBtn);
-    card.appendChild(actions);
-    g.appendChild(card);
-  });
 
   _defer(()=>{
 
@@ -33144,8 +33369,27 @@ settings:()=>{
 
 
   const c1=el('div',{className:'card'});c1.appendChild(txt('h2','Profile'));
+  /* Avatar preview + a "shuffle" so users get some profile identity
+     (the identicon is derived from a seed they can change). */
+  const _avatarRow=el('div',{style:{display:'flex',alignItems:'center',gap:'10px',marginBottom:'8px'}});
+  const _avatarWrap=el('div',{id:'profileAvatar'});
+  function _paintAvatar(){
+    _avatarWrap.innerHTML='';
+    const seed=S.avatarSeed||S.user||'Reader';
+    if(typeof _avatarEl==='function')_avatarWrap.appendChild(_avatarEl(seed,52));
+  }
+  _paintAvatar();
+  const _shuf=txt('button','Shuffle avatar',{className:'btn small'});
+  _shuf.onclick=()=>{S.avatarSeed=(S.user||'Reader')+'_'+Math.random().toString(36).slice(2,7);save();_paintAvatar();toast('New avatar');};
+  _avatarRow.append(_avatarWrap,_shuf);c1.appendChild(_avatarRow);
   c1.appendChild(el('input',{id:'userNameInput',value:S.user||'Reader'}));
   c1.appendChild(txt('button','Save Name',{className:'btn',id:'saveUserName',style:{marginTop:'6px'}}));
+  /* Status line — a short "about me" shown nowhere sensitive, just a bit of
+     profile personality (community asked for more customisation). */
+  c1.appendChild(txt('div','STATUS',{style:{fontSize:'10px',fontWeight:'800',letterSpacing:'0.7px',color:'var(--muted)',margin:'10px 0 4px'}}));
+  const _statusInp=el('input',{id:'profileStatus',placeholder:'A short status or motto…',value:S.profileStatus||'',maxLength:80,style:{width:'100%'}});
+  _statusInp.oninput=()=>{S.profileStatus=_statusInp.value.slice(0,80);save();};
+  c1.appendChild(_statusInp);
 
   /* Location picker */
   c1.appendChild(el('hr',{style:{border:'none',borderTop:'var(--thin)',margin:'10px 0'}}));
@@ -33166,7 +33410,7 @@ settings:()=>{
     /* If current selection gone, pick first */
     if(!locSel.value)locSel.selectedIndex=0;
   }
-  citySearchInp.oninput=()=>filterCities(citySearchInp.value);
+  citySearchInp.oninput=khDebounce(()=>filterCities(citySearchInp.value),180);
   c1.appendChild(citySearchInp);
 
   const locSel=el('select',{style:{marginBottom:'6px',fontSize:'12px'}});
@@ -33401,6 +33645,8 @@ settings:()=>{
   let _isRegMode=false,_pwConfirmWrap=null;
   const _accForm=el('div',{style:{display:S.authToken?'none':'flex',flexDirection:'column',gap:'6px',marginBottom:'8px'}});
   const _accEmail=el('input',{type:'text',placeholder:'Username',autocomplete:'username',style:{fontSize:'12px'}});
+  /* Remember the last account so signing back in (incl. offline) is one tap. */
+  try{const _lu=localStorage.getItem('kh_last_user');if(_lu)_accEmail.value=_lu;}catch(_){}
   const _accPw=el('input',{type:'password',placeholder:'Password',style:{fontSize:'12px'}});
   const _accPwConfirm=el('input',{type:'password',placeholder:'Confirm password',style:{fontSize:'12px',display:'none'}});
   const _pwNote=txt('p','Use a unique password for KindleHub Pro only.',{style:{fontSize:'11px',color:'var(--muted)',margin:'0',lineHeight:'1.5',padding:'6px 8px',background:'var(--highlight)',borderRadius:'7px'}});
@@ -33999,14 +34245,17 @@ settings:()=>{
   });
   cKbd.appendChild(modeRow);
   g.appendChild(cKbd);
-  });
-  _defer(()=>{
+  /* NOTE: this used to close the _defer here and reopen a new one, which
+     left `c5` (declared above) out of scope below — so the Keyboard
+     Shortcuts AND Top Menu Pages cards both threw 'c5 is not defined' and
+     never rendered. Kept as ONE block so c5 stays in scope. */
   const st=el('div',{style:{fontSize:'12px',lineHeight:'2'}});
   [['Snake / 2048','Arrow keys'],['Wordle — type','Letter keys'],['Wordle — submit','Enter'],['Wordle — delete','Backspace'],['Hangman — type','Letter keys'],['Chat — send','Enter']].forEach(([k,val])=>{
     const row=el('div',{style:{display:'flex',justifyContent:'space-between',borderBottom:'1px dashed var(--muted)',padding:'1px 0'}});
     row.appendChild(txt('span',k));row.appendChild(txt('code',val,{style:{background:'var(--highlight)',padding:'1px 5px',borderRadius:'3px',fontSize:'11px'}}));st.appendChild(row);
   });
   c5.appendChild(st);
+  g.appendChild(c5);/* was never appended — the Keyboard Shortcuts card never showed */
   /* ── Top Menu Pages — re-orderable + hide/show ── */
   const cNav=el('div',{className:'card',style:{gridColumn:'1/-1'}});
   cNav.appendChild(txt('h2','Top Menu Pages'));
@@ -34020,13 +34269,19 @@ settings:()=>{
     const labelMap=Object.fromEntries(NAV_TABS);
     order.forEach((view,idx)=>{
       const label=labelMap[view]||view;
-      const isHidden=S.navHidden[view]===true;
+      /* Home + Settings can never be hidden — they anchor the nav. Force
+         their state correct so a stale navHidden entry can't strand the
+         user, and lock their toggle. */
+      const locked=(view==='home'||view==='settings');
+      if(locked&&S.navHidden[view]){S.navHidden[view]=false;}
+      const isHidden=!locked&&S.navHidden[view]===true;
       const row=el('div',{style:'display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--card);border-radius:6px;'});
       /* Visibility checkbox */
-      const tog=el('button',{style:'width:22px;height:22px;border:2px solid var(--fg);border-radius:4px;padding:0;background:'+(isHidden?'transparent':'var(--fg)')+';color:var(--bg);cursor:pointer;flex-shrink:0;font-weight:900;font-size:14px;line-height:1;'});
+      const tog=el('button',{style:'width:22px;height:22px;border:2px solid var(--fg);border-radius:4px;padding:0;background:'+(isHidden?'transparent':'var(--fg)')+';color:var(--bg);cursor:'+(locked?'default':'pointer')+';flex-shrink:0;font-weight:900;font-size:14px;line-height:1;'+(locked?'opacity:0.5;':'')});
       tog.textContent=isHidden?'':'✓';
-      tog.title=isHidden?'Show in top menu':'Hide from top menu';
-      tog.onclick=()=>{
+      tog.title=locked?label+' is always in the menu':(isHidden?'Show in top menu':'Hide from top menu');
+      tog.disabled=locked;
+      if(!locked)tog.onclick=()=>{
         S.navHidden[view]=!isHidden;save();
         setNavTabVisible(view,!S.navHidden[view]);
         _renderNavList();
@@ -34065,7 +34320,9 @@ settings:()=>{
   };
   const hideAllBtn=txt('button','Hide All',{className:'btn small'});
   hideAllBtn.onclick=()=>{
-    NAV_TABS.forEach(([view])=>{S.navHidden[view]=true;setNavTabVisible(view,false);});
+    /* Never hide Home/Settings — hiding them used to strand the user with
+       no way back until a reload. */
+    NAV_TABS.forEach(([view])=>{if(view==='home'||view==='settings')return;S.navHidden[view]=true;setNavTabVisible(view,false);});
     save();_renderNavList();toast('All optional top-menu pages hidden');
   };
   const resetBtn=txt('button','Reset Order',{className:'btn small'});
@@ -34262,6 +34519,7 @@ settings:()=>{
   cContrib.appendChild(aiGrid);
   cContrib.appendChild(txt('div','Community contributors',{style:{fontSize:'11px',fontWeight:'800',textTransform:'uppercase',letterSpacing:'.5px',color:'var(--muted)',margin:'4px 0 6px'}}));
   let _humans=[];try{const _h=JSON.parse(localStorage.getItem('kh_contributors')||'[]');if(Array.isArray(_h))_humans=_h.filter(Boolean);}catch(_){}
+  if(typeof _khIsBannedSync==='function')_humans=_humans.filter(n=>!_khIsBannedSync(n));
   if(_humans.length){
     const hWrap=el('div',{style:{display:'flex',flexWrap:'wrap',gap:'5px'}});
     _humans.sort((a,b)=>a.localeCompare(b)).forEach(n=>{
@@ -34571,6 +34829,7 @@ feedback:()=>{
         let rows;
         try{
           rows=await _sbSelect('kh_presence','select=user_id,display_name,last_seen&last_seen=gte.'+encodeURIComponent(since)+'&order=last_seen.desc&limit=500');
+          if(typeof _khIsBannedSync==='function'&&Array.isArray(rows))rows=rows.filter(r=>!_khIsBannedSync(r&&r.display_name));
         }catch(e){
           onlineBox.innerHTML='';
           onlineBox.appendChild(txt('span','kh_presence table not found. ',{style:{color:'var(--danger)',fontWeight:'700'}}));
@@ -35701,6 +35960,15 @@ Deno.serve(async (req)=>{
       const ul=el('div',{style:{fontSize:'11px',color:'var(--muted)',lineHeight:'1.6'}});
       meas.forEach(m=>ul.appendChild(txt('div','✓ '+m)));
       c.appendChild(ul);
+      /* Mail gateway — paste the deployed email-worker.js URL here to switch
+         on real internet email (see the worker file for the 10-min setup). */
+      c.appendChild(txt('div','Mail gateway (external email)',{style:{fontSize:'11px',fontWeight:'800',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.5px',margin:'12px 0 4px'}}));
+      const gwRow=el('div',{style:{display:'flex',gap:'5px'}});
+      const gwIn=el('input',{type:'text',placeholder:'https://your-worker.workers.dev',value:(localStorage.getItem('kh_mail_gateway')||''),style:{flex:'1',fontSize:'11px',fontFamily:'monospace'}});
+      const gwSave=txt('button','Save',{className:'btn small'});
+      gwSave.onclick=()=>{try{const v=gwIn.value.trim();if(v)localStorage.setItem('kh_mail_gateway',v);else localStorage.removeItem('kh_mail_gateway');toast(v?'Gateway saved — external email is ON for this device.':'Gateway cleared.');}catch(_){}};
+      gwRow.append(gwIn,gwSave);c.appendChild(gwRow);
+      c.appendChild(txt('div','Deploy email-worker.js (in the repo) to Cloudflare, then paste its URL. Inbound mail needs no URL — it flows via Email Routing once the worker is live.',{style:{fontSize:'10px',color:'var(--muted)',marginTop:'4px',lineHeight:'1.5'}}));
       return c;
     }
     async function renderErrPanel(){
@@ -36198,7 +36466,7 @@ Deno.serve(async (req)=>{
       try{
         const cur=JSON.parse(localStorage.getItem('kh_contributors')||'[]');
         const set=new Set(Array.isArray(cur)?cur:[]);
-        items.forEach(i=>{const a=(i.author||'').trim();if(a&&a.toLowerCase()!=='anonymous'&&a.toLowerCase()!=='anon')set.add(a.slice(0,40));});
+        items.forEach(i=>{const a=(i.author||'').trim();if(!a||a.toLowerCase()==='anonymous'||a.toLowerCase()==='anon')return;if(typeof _khIsBannedSync==='function'&&_khIsBannedSync(a))return;set.add(a.slice(0,40));});
         localStorage.setItem('kh_contributors',JSON.stringify([...set].slice(0,300)));
       }catch(_){}
       setStatus('');
@@ -40858,8 +41126,8 @@ notes:()=>{
   const tagInp=el('input',{placeholder:'#tag filter',style:{width:'90px',flex:'none',fontSize:'12px'}});
   const sortSel=el('select',{style:{fontSize:'11px',padding:'4px 6px',border:'var(--thin)',borderRadius:'6px',background:'var(--card)',color:'var(--fg)'}});
   [['newest','Newest first'],['oldest','Oldest first'],['az','A-Z'],['pinned','Pinned first'],['longest','Longest first'],['shortest','Shortest first']].forEach(([v2,t])=>{const o=el('option',{value:v2});o.textContent=t;sortSel.appendChild(o);});
-  searchInp.oninput=()=>renderList();
-  tagInp.oninput=()=>renderList();
+  searchInp.oninput=khDebounce(()=>renderList(),180);
+  tagInp.oninput=khDebounce(()=>renderList(),180);
   sortSel.onchange=()=>renderList();
   toolbar.append(searchInp,tagInp,sortSel);
   /* Bulk-select toggle — when ON, every note card sprouts a checkbox
@@ -41177,8 +41445,8 @@ notes:()=>{
     });
   }
 
-  searchInp.oninput=renderList;
-  tagInp.oninput=renderList;
+  searchInp.oninput=khDebounce(renderList,180);
+  tagInp.oninput=khDebounce(renderList,180);
   sortSel.onchange=renderList;
   renderList();
   return v;
@@ -41612,7 +41880,7 @@ periodic:()=>{
       dp.appendChild(row);
     });
   }
-  srchInp.oninput=()=>renderTable(srchInp.value);
+  srchInp.oninput=khDebounce(()=>renderTable(srchInp.value),180);
   renderTable('');
   table.appendChild(ptGrid);
   tableWrap.appendChild(table);
@@ -43737,17 +44005,43 @@ mail:()=>{
   v.appendChild(khCard);
   if(!S.authToken||!_myMailUser()){
     khCard.appendChild(khHdr);
-    khCard.appendChild(txt('p','Sign in (Settings → Account) and you get your own address — username@'+KH_MAIL_DOMAIN+' — to send and receive mail with every other KindleHub user. Free, encrypted, works on this Kindle.',{style:{fontSize:'12px',color:'var(--muted)',lineHeight:'1.6'}}));
-    const goBtn=txt('button','Open Settings → Account',{className:'btn primary small',style:{marginTop:'6px'}});
-    goBtn.onclick=()=>{const t=document.querySelector('nav .tab[data-view="settings"]');if(t)t.click();};
+    if(S.authToken&&!_myMailUser()){
+      /* Signed in but the session has no stored username (account predates
+         it, or state was partially restored) — tell them exactly what to
+         do instead of pointing at a Settings page that can't help. */
+      khCard.appendChild(txt('p','You are signed in, but this session has no username attached — that is what becomes your address. Fix: Settings → Account → Log out, then sign back in with your username and password. Your address will be username@'+KH_MAIL_DOMAIN+'.',{style:{fontSize:'12px',color:'var(--muted)',lineHeight:'1.6'}}));
+    }else{
+      khCard.appendChild(txt('p','Your mail address is your account username + @'+KH_MAIL_DOMAIN+'. To claim it: Settings → scroll to the ACCOUNT card → type a username and password → tap Register (or Sign In if you already have one). Come back here and your inbox is live.',{style:{fontSize:'12px',color:'var(--muted)',lineHeight:'1.6'}}));
+    }
+    const goBtn=txt('button','Open Settings',{className:'btn primary small',style:{marginTop:'6px'}});
+    goBtn.onclick=()=>{
+      const t=document.querySelector('nav .tab[data-view="settings"]');if(t)t.click();
+      /* Scroll the Account card into view so "in Settings" is not a hunt. */
+      setTimeout(()=>{try{
+        const heads=[...document.querySelectorAll('#view-settings h2')];
+        const acc=heads.find(h=>/account/i.test(h.textContent));
+        if(acc)acc.scrollIntoView({block:'start'});
+      }catch(_){}},600);
+    };
     khCard.appendChild(goBtn);
   } else {
     const myAddr=_myMailUser()+'@'+KH_MAIL_DOMAIN;
-    khHdr.appendChild(txt('span',myAddr,{style:{fontSize:'11px',fontFamily:'monospace',color:'var(--muted)'}}));
+    const addrWrap=el('span',{style:{display:'inline-flex',alignItems:'center',gap:'6px'}});
+    addrWrap.appendChild(txt('span',myAddr,{style:{fontSize:'11px',fontFamily:'monospace',color:'var(--muted)'}}));
+    const extOn=!!_mailGatewayUrl();
+    const extChip=txt('span',extOn?'internet mail: on':'KindleHub-only',{title:extOn?'This address can mail any email address on the internet.':'Sends between KindleHub accounts. The admin can enable internet mail by deploying email-worker.js.',style:{fontSize:'9px',fontWeight:'800',letterSpacing:'.4px',textTransform:'uppercase',padding:'2px 7px',borderRadius:'999px',border:'var(--thin)',color:extOn?'var(--bg)':'var(--muted)',background:extOn?'var(--fg)':'var(--card)'}});
+    addrWrap.appendChild(extChip);
+    khHdr.appendChild(addrWrap);
     khCard.appendChild(khHdr);
     /* Folder chips + actions */
-    let folder='inbox',mails=[],openId=null,loading=false;
-    const bar=el('div',{style:{display:'flex',gap:'5px',flexWrap:'wrap',alignItems:'center',marginBottom:'8px'}});
+    let folder='inbox',mails=[],openId=null,loading=false,query='';
+    const bar=el('div',{style:{display:'flex',gap:'5px',flexWrap:'wrap',alignItems:'center',marginBottom:'6px'}});
+    /* Local search — filters the already-fetched rows, zero extra requests */
+    const searchRow=el('div',{style:{display:'flex',gap:'5px',marginBottom:'8px'}});
+    const searchIn=el('input',{type:'text',placeholder:'Search mail…',style:{flex:'1',fontSize:'12px'}});
+    let _mailSearchT=null;
+    searchIn.oninput=()=>{if(_mailSearchT)clearTimeout(_mailSearchT);_mailSearchT=setTimeout(()=>{query=searchIn.value.trim().toLowerCase();renderList();},180);};
+    searchRow.appendChild(searchIn);
     const listEl=el('div');
     const FOLDERS=[['inbox','Inbox'],['sent','Sent'],['archive','Archive'],['trash','Trash']];
     function st(){return _mailState();}
@@ -43757,15 +44051,28 @@ mail:()=>{
       return e.folder||'inbox';
     }
     function setMailFlag(id,patch){const s=st();s[id]=Object.assign({},s[id]||{},patch);save();}
-    function fmtTs(ts){try{const d=new Date(ts);return d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}catch(_){return '';}}
+    function fmtTs(ts){try{const d=new Date(new Date(ts).getTime()+((typeof S!=='undefined'&&S.clockOffset)||0));return d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}catch(_){return '';}}
+    /* Bare usernames get the home domain; full external addresses (anything
+       already containing @) pass through untouched. */
+    function _addrLbl(a){a=String(a||'');return a.includes('@')?a:(a+'@'+KH_MAIL_DOMAIN);}
+    function unreadCount(){
+      if(folder==='sent')return 0;
+      return mails.filter(m=>effFolder(m)==='inbox'&&!(st()[m.id]||{}).read).length;
+    }
     function renderBar(){
       bar.innerHTML='';
       FOLDERS.forEach(([id,label])=>{
-        const b=txt('button',label,{className:'btn small'+(folder===id?' primary':'')});
+        const n=(id==='inbox')?unreadCount():0;
+        const b=txt('button',label+(n?' ('+n+')':''),{className:'btn small'+(folder===id?' primary':'')});
         b.onclick=()=>{folder=id;openId=null;loadMail();};
         bar.appendChild(b);
       });
       const spacer=el('span',{style:{flex:'1'}});bar.appendChild(spacer);
+      if(folder==='inbox'&&unreadCount()>1){
+        const mar=txt('button','Mark all read',{className:'btn small'});
+        mar.onclick=()=>{mails.forEach(m=>{if(effFolder(m)==='inbox')setMailFlag(m.id,{read:true});});renderBar();renderList();};
+        bar.appendChild(mar);
+      }
       const compose=txt('button','✉ Compose',{className:'btn small primary'});
       compose.onclick=()=>composeModal();
       const refresh=txt('button','Refresh',{className:'btn small'});
@@ -43780,34 +44087,77 @@ mail:()=>{
         listEl.appendChild(txt('div',folder==='inbox'?'No mail yet. Tap Compose to write to any KindleHub user — just their username.':'Nothing in '+folder+'.',{style:{fontSize:'12px',color:'var(--muted)',padding:'12px 4px',lineHeight:'1.6'}}));
         return;
       }
-      visible.forEach(m=>{
+      const q=query;
+      const shown=q?visible.filter(m=>((m.subject||'')+' '+(m.from||'')+' '+(m.to||'')+' '+(m.body||'')).toLowerCase().includes(q)):visible;
+      if(q&&!shown.length){listEl.appendChild(txt('div','No mail matches "'+q+'".',{style:{fontSize:'12px',color:'var(--muted)',padding:'12px 4px'}}));return;}
+      shown.forEach(m=>{
         const e=st()[m.id]||{};
         const unread=folder!=='sent'&&!e.read;
         const row=el('div',{style:{borderTop:'var(--thin)',padding:'9px 4px',cursor:'pointer'}});
-        const line1=el('div',{style:{display:'flex',justifyContent:'space-between',gap:'8px',alignItems:'baseline'}});
-        const who=folder==='sent'?('To: '+m.to+'@'+KH_MAIL_DOMAIN):(m.from+'@'+KH_MAIL_DOMAIN);
-        line1.appendChild(txt('span',who,{style:{fontSize:'12px',fontWeight:unread?'900':'600',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'60%'}}));
-        line1.appendChild(txt('span',fmtTs(m.ts),{style:{fontSize:'10px',color:'var(--muted)',flexShrink:'0'}}));
+        const line1=el('div',{style:{display:'flex',gap:'8px',alignItems:'center'}});
+        const who=folder==='sent'?('To: '+m.to):(m.from);
+        if(typeof _avatarEl==='function')line1.appendChild(_avatarEl(folder==='sent'?m.to:m.from,24));
+        const whoCol=el('div',{style:{flex:'1',minWidth:'0'}});
+        whoCol.appendChild(txt('div',_addrLbl(who),{style:{fontSize:'12px',fontWeight:unread?'900':'600',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
+        whoCol.appendChild(txt('div',m.subject||'(no subject)',{style:{fontSize:'12px',fontWeight:unread?'800':'400',color:unread?'var(--fg)':'var(--muted)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
+        line1.appendChild(whoCol);
+        line1.appendChild(txt('span',fmtTs(m.ts),{style:{fontSize:'10px',color:'var(--muted)',flexShrink:'0',alignSelf:'flex-start',marginTop:'2px'}}));
         row.appendChild(line1);
-        row.appendChild(txt('div',m.subject||'(no subject)',{style:{fontSize:'12px',fontWeight:unread?'800':'400',color:unread?'var(--fg)':'var(--muted)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',marginTop:'2px'}}));
+        /* One-line body preview under the subject (closed rows only) */
+        if(openId!==m.id){
+          const prev=(m.body||'').replace(/\s+/g,' ').trim().slice(0,90);
+          if(prev)row.appendChild(txt('div',prev,{style:{fontSize:'11px',color:'var(--muted)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',marginTop:'2px',paddingLeft:'32px'}}));
+        }
         if(openId===m.id){
-          const body=el('div',{style:{margin:'8px 0',padding:'10px',background:'var(--highlight)',borderRadius:'8px',fontSize:'13px',lineHeight:'1.65',whiteSpace:'pre-wrap',wordBreak:'break-word'}});
+          /* Reading pane header — who/when in full, then the body */
+          const hdrBox=el('div',{style:{margin:'8px 0 0',padding:'8px 10px',background:'var(--card)',border:'var(--thin)',borderRadius:'8px 8px 0 0',fontSize:'11px',color:'var(--muted)',lineHeight:'1.6'}});
+          hdrBox.appendChild(txt('div','From: '+_addrLbl(folder==='sent'?_myMailUser():m.from)));
+          hdrBox.appendChild(txt('div','To: '+_addrLbl(m.to)+'   ·   '+fmtTs(m.ts)));
+          row.appendChild(hdrBox);
+          const body=el('div',{style:{margin:'0 0 8px',padding:'10px',background:'var(--highlight)',borderRadius:'0 0 8px 8px',fontSize:'13px',lineHeight:'1.65',whiteSpace:'pre-wrap',wordBreak:'break-word'}});
           body.textContent=m.body||'(empty)';
           row.appendChild(body);
+          /* KHI row — summarise long mail, draft a reply. Uses the user's
+             own AI key (khiCall); costs no Supabase bandwidth. */
+          if(typeof khiEnabled==='function'&&khiEnabled()&&(m.body||'').length>0){
+            const khiRow=el('div',{style:{display:'flex',gap:'5px',flexWrap:'wrap',marginBottom:'6px'}});
+            const khiOut=el('div',{className:'khi-output',style:{display:'none',marginBottom:'6px'}});
+            if((m.body||'').length>220){
+              const sumBtn=txt('button','✦ Summarise',{className:'btn small'});
+              sumBtn.onclick=async ev=>{ev.stopPropagation();sumBtn.disabled=true;sumBtn.textContent='✦ Thinking…';
+                try{const out=await khiCall('Summarise this mail in 2 short bullet points. No preamble.\n\nFrom: '+m.from+'\nSubject: '+(m.subject||'')+'\n\n'+(m.body||'').slice(0,4000),{maxTokens:200});
+                  if(out){khiOut.textContent=out.trim();khiOut.style.display='block';}}
+                catch(_){toast('Summary failed — try again');}
+                sumBtn.disabled=false;sumBtn.textContent='✦ Summarise';};
+              khiRow.appendChild(sumBtn);
+            }
+            if(folder!=='sent'){
+              const draftBtn=txt('button','✦ Draft reply',{className:'btn small'});
+              draftBtn.onclick=async ev=>{ev.stopPropagation();draftBtn.disabled=true;draftBtn.textContent='✦ Drafting…';
+                try{const out=await khiCall('Write a short, friendly reply (2-4 sentences) to this mail. Output ONLY the reply body, no greeting-name placeholders, no signature.\n\nFrom: '+m.from+'\nSubject: '+(m.subject||'')+'\n\n'+(m.body||'').slice(0,3000),{maxTokens:260});
+                  if(out)composeModal(m.from,'Re: '+(m.subject||''),out.trim()+'\n\n— On '+fmtTs(m.ts)+', '+m.from+' wrote —\n'+(m.body||'').split('\n').map(l=>'> '+l).join('\n'),m.id);}
+                catch(_){toast('Draft failed — try again');}
+                draftBtn.disabled=false;draftBtn.textContent='✦ Draft reply';};
+              khiRow.appendChild(draftBtn);
+            }
+            row.appendChild(khiRow);row.appendChild(khiOut);
+          }
           const acts=el('div',{style:{display:'flex',gap:'5px',flexWrap:'wrap'}});
           if(folder!=='sent'){
             const rep=txt('button','Reply',{className:'btn small primary'});
             rep.onclick=ev=>{ev.stopPropagation();composeModal(m.from,'Re: '+(m.subject||''),'\n\n— On '+fmtTs(m.ts)+', '+m.from+' wrote —\n'+(m.body||'').split('\n').map(l=>'> '+l).join('\n'),m.id);};
             acts.appendChild(rep);
             const fwd=txt('button','Forward',{className:'btn small'});
-            fwd.onclick=ev=>{ev.stopPropagation();composeModal('','Fwd: '+(m.subject||''),'\n\n— Forwarded from '+m.from+'@'+KH_MAIL_DOMAIN+' —\n'+(m.body||''));};
+            fwd.onclick=ev=>{ev.stopPropagation();composeModal('','Fwd: '+(m.subject||''),'\n\n— Forwarded from '+_addrLbl(m.from)+' —\n'+(m.body||''));};
             acts.appendChild(fwd);
             if(effFolder(m)!=='archive'){const ar=txt('button','Archive',{className:'btn small'});ar.onclick=ev=>{ev.stopPropagation();setMailFlag(m.id,{folder:'archive'});renderList();};acts.appendChild(ar);}
             else{const un=txt('button','To Inbox',{className:'btn small'});un.onclick=ev=>{ev.stopPropagation();setMailFlag(m.id,{folder:'inbox'});renderList();};acts.appendChild(un);}
             if(effFolder(m)!=='trash'){const tr=txt('button','Trash',{className:'btn small',style:{color:'var(--danger)',borderColor:'var(--danger)'}});tr.onclick=ev=>{ev.stopPropagation();setMailFlag(m.id,{folder:'trash'});openId=null;renderList();};acts.appendChild(tr);}
           } else {
             const un=txt('button','Unsend',{className:'btn small',style:{color:'var(--danger)',borderColor:'var(--danger)'}});
-            un.onclick=async ev=>{ev.stopPropagation();if(!await kindleConfirm('Unsend this mail? It disappears from the recipient too.'))return;
+            const _ext=_mailIsExternal(m.to);
+            if(_ext)un.textContent='Delete copy';
+            un.onclick=async ev=>{ev.stopPropagation();if(!await kindleConfirm(_ext?'Delete your copy? (The email itself was already delivered and can\'t be recalled.)':'Unsend this mail? It disappears from the recipient too.'))return;
               try{await _mailUnsend(m.id);mails=mails.filter(x=>x.id!==m.id);openId=null;renderList();toast('Mail unsent.');}
               catch(e2){toast(String(e2&&e2.message||'Could not unsend.'),3500);}};
             acts.appendChild(un);
@@ -43842,22 +44192,64 @@ mail:()=>{
       const box=el('div',{style:{background:'var(--card)',borderRadius:'12px',padding:'14px',width:'100%',maxWidth:'460px',maxHeight:'90vh',overflowY:'auto',boxShadow:'var(--shadow-md)'}});
       box.appendChild(txt('h3','New mail',{style:{margin:'0 0 8px',fontFamily:'var(--title-font)'}}));
       const toRow=el('div',{style:{display:'flex',alignItems:'center',gap:'4px',marginBottom:'6px'}});
-      const toIn=el('input',{type:'text',placeholder:'username',value:toPre||'',style:{flex:'1',fontSize:'13px'}});
-      toRow.appendChild(toIn);toRow.appendChild(txt('span','@'+KH_MAIL_DOMAIN,{style:{fontSize:'12px',color:'var(--muted)',fontFamily:'monospace'}}));
+      const toIn=el('input',{type:'text',placeholder:'username or name@gmail.com',value:toPre||'',style:{flex:'1',fontSize:'13px'}});
+      toRow.appendChild(toIn);
+      const sufSpan=txt('span','@'+KH_MAIL_DOMAIN,{style:{fontSize:'12px',color:'var(--muted)',fontFamily:'monospace'}});
+      toRow.appendChild(sufSpan);
+      /* Typing a full address (anything with @) suppresses the suffix —
+         that's how you mail the outside world (alice@gmail.com). */
+      const _sufSync=()=>{sufSpan.style.display=toIn.value.includes('@')?'none':'';};
+      toIn.addEventListener('input',_sufSync);_sufSync();
       box.appendChild(toRow);
       const subjIn=el('input',{type:'text',placeholder:'Subject',value:subjPre||'',style:{width:'100%',fontSize:'13px',marginBottom:'6px'}});
       box.appendChild(subjIn);
+      /* Recent recipients — one-tap chips, filled from mail you've sent */
+      const recents=(Array.isArray(S.mailContacts)?S.mailContacts:[]).filter(c=>c&&c!==_myMailUser()).slice(0,6);
+      if(recents.length&&!toPre){
+        const chipRow=el('div',{style:{display:'flex',gap:'4px',flexWrap:'wrap',marginBottom:'6px'}});
+        recents.forEach(c=>{
+          const chip=txt('button',c,{className:'btn small',style:{fontSize:'10px',padding:'2px 9px',minHeight:'24px'}});
+          chip.onclick=()=>{toIn.value=c;subjIn.focus();};
+          chipRow.appendChild(chip);
+        });
+        box.appendChild(chipRow);
+      }
       const bodyIn=el('textarea',{rows:8,placeholder:'Write your mail…',style:{width:'100%',fontSize:'13px',fontFamily:'var(--body-font)',resize:'vertical'}});
       bodyIn.value=bodyPre||'';
       box.appendChild(bodyIn);
-      const btns=el('div',{style:{display:'flex',gap:'6px',justifyContent:'flex-end',marginTop:'10px'}});
+      const meta=txt('div','',{style:{fontSize:'10px',color:'var(--muted)',textAlign:'right',marginTop:'2px'}});
+      const updMeta=()=>{meta.textContent=bodyIn.value.length+' / 8000';};
+      bodyIn.addEventListener('input',updMeta);updMeta();
+      box.appendChild(meta);
+      const btns=el('div',{style:{display:'flex',gap:'6px',justifyContent:'flex-end',marginTop:'10px',flexWrap:'wrap'}});
+      /* ✦ Polish — KHI rewrite of the draft for clarity/tone (user's own
+         AI key, no Supabase cost). Keeps the quoted thread intact. */
+      if(typeof khiEnabled==='function'&&khiEnabled()){
+        const polish=txt('button','✦ Polish',{className:'btn small',style:{marginRight:'auto'}});
+        polish.onclick=async()=>{
+          const raw=bodyIn.value;
+          if(!raw.trim()){toast('Write something first.');return;}
+          polish.disabled=true;polish.textContent='✦ Polishing…';
+          try{
+            /* Split off any quoted thread ("— On … wrote —") so only the
+               user's own words get rewritten. */
+            const cut=raw.search(/\n+— (On |Forwarded from )/);
+            const mine=cut>=0?raw.slice(0,cut):raw;
+            const rest=cut>=0?raw.slice(cut):'';
+            const out=await khiCall('Rewrite this mail draft to be clearer and friendlier. Keep the same meaning and rough length. Output ONLY the rewritten draft.\n\n'+mine.slice(0,3000),{maxTokens:400});
+            if(out){bodyIn.value=out.trim()+rest;updMeta();toast('Draft polished — review before sending.');}
+          }catch(_){toast('Polish failed — try again');}
+          polish.disabled=false;polish.textContent='✦ Polish';
+        };
+        btns.appendChild(polish);
+      }
       const cancel=txt('button','Cancel',{className:'btn small'});cancel.onclick=()=>ov.remove();
       const send=txt('button','Send',{className:'btn small primary'});
       send.onclick=async()=>{
         send.disabled=true;send.textContent='Sending…';
         try{
           await _mailSend(toIn.value,subjIn.value,bodyIn.value,replyTo);
-          ov.remove();toast('Mail sent to '+_mailNorm(toIn.value)+'@'+KH_MAIL_DOMAIN,3000);
+          ov.remove();toast('Mail sent to '+_addrLbl(toIn.value.trim().toLowerCase()),3000);
           if(folder==='sent')loadMail();
         }catch(e){send.disabled=false;send.textContent='Send';toast(String(e&&e.message||'Send failed.'),4000);}
       };
@@ -43867,6 +44259,7 @@ mail:()=>{
       setTimeout(()=>{(toPre?subjPre?bodyIn:subjIn:toIn).focus();},60);
     }
     khCard.appendChild(bar);
+    khCard.appendChild(searchRow);
     khCard.appendChild(listEl);
     renderBar();
     loadMail();
@@ -44030,6 +44423,56 @@ mail:()=>{
      random.php              → one random recipe
      filter.php?c=<category> → list by category
 ─────────────────────────────────────────────────────────── */
+gallery:()=>{
+  /* Screenshot / image viewer (community request). Kindles save screenshots
+     to the device; a web page can't read the filesystem, so the user picks
+     image files and views them here. Kept in-session (not persisted) so it
+     never bloats the saved state. */
+  const v=el('section',{id:'view-gallery',className:'view'});
+  v.appendChild(txt('h2','Gallery',{style:{fontFamily:'var(--title-font)',fontSize:'16px',marginBottom:'4px'}}));
+  v.appendChild(txt('p','View your Kindle screenshots and images. Tap "Add images" and pick the screenshots from your device — they show here for this session. Tap any image to view it full-size.',{style:{fontSize:'12px',color:'var(--muted)',lineHeight:'1.55',marginBottom:'12px'}}));
+  if(!window._khGallery)window._khGallery=[];/* session-only list of {name,url} */
+  const fileInp=el('input',{type:'file',accept:'image/*',multiple:true,style:{display:'none'}});
+  const addBtn=txt('button','+ Add images',{className:'btn primary small'});
+  addBtn.onclick=()=>fileInp.click();
+  const clearBtn=txt('button','Clear',{className:'btn small'});
+  const row=el('div',{style:{display:'flex',gap:'6px',marginBottom:'12px',flexWrap:'wrap'}});
+  row.append(addBtn,clearBtn);v.appendChild(row);v.appendChild(fileInp);
+  const grid=el('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(120px,1fr))',gap:'8px'}});
+  v.appendChild(grid);
+  function renderGrid(){
+    grid.innerHTML='';
+    if(!window._khGallery.length){grid.appendChild(txt('div','No images yet. Tap "+ Add images" to load your screenshots.',{style:{gridColumn:'1/-1',fontSize:'12px',color:'var(--muted)',padding:'10px',textAlign:'center'}}));return;}
+    window._khGallery.forEach((img,i)=>{
+      const cell=el('div',{style:{position:'relative',border:'var(--thin)',borderRadius:'8px',overflow:'hidden',background:'var(--card)',aspectRatio:'1',cursor:'pointer'}});
+      const im=el('img',{src:img.url,style:{width:'100%',height:'100%',objectFit:'cover',display:'block'}});
+      im.onclick=()=>showFull(img);
+      cell.appendChild(im);
+      const x=el('button',{type:'button',style:{position:'absolute',top:'3px',right:'3px',width:'20px',height:'20px',lineHeight:'18px',padding:'0',borderRadius:'50%',border:'none',background:'rgba(0,0,0,0.6)',color:'#fff',fontSize:'13px',fontWeight:'900',cursor:'pointer'}});
+      x.textContent='×';x.onclick=ev=>{ev.stopPropagation();const j=window._khGallery.indexOf(img);if(j<0)return;try{URL.revokeObjectURL(img.url);}catch(_){}window._khGallery.splice(j,1);renderGrid();};
+      cell.appendChild(x);grid.appendChild(cell);
+    });
+  }
+  function showFull(img){
+    const ov=el('div',{style:{position:'fixed',top:'0',left:'0',right:'0',bottom:'0',background:'rgba(0,0,0,0.92)',zIndex:'600200',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'10px'}});
+    if(!img)return;
+    const im=el('img',{src:img.url,style:{maxWidth:'100%',maxHeight:'88%',objectFit:'contain'}});
+    const cap=txt('div',img.name||'',{style:{color:'#fff',fontSize:'11px',marginTop:'8px',maxWidth:'90%',textAlign:'center',wordBreak:'break-all'}});
+    const close=txt('button','Close',{className:'btn small',style:{marginTop:'10px'}});
+    close.onclick=()=>ov.remove();ov.onclick=e=>{if(e.target===ov)ov.remove();};
+    ov.append(im,cap,close);document.body.appendChild(ov);
+  }
+  fileInp.onchange=e=>{
+    const files=Array.from(e.target.files||[]);
+    files.forEach(f=>{if(f.type.startsWith('image/'))window._khGallery.push({name:f.name,url:URL.createObjectURL(f)});});
+    fileInp.value='';renderGrid();
+    if(files.length)toast(files.length+' image'+(files.length===1?'':'s')+' added.',1800);
+  };
+  clearBtn.onclick=()=>{window._khGallery.forEach(g=>{try{URL.revokeObjectURL(g.url);}catch(_){}});window._khGallery=[];renderGrid();};
+  renderGrid();
+  return v;
+},
+
 cookbook:()=>{
   const v=el('section',{id:'view-cookbook',className:'view'});
 
@@ -48249,14 +48692,19 @@ messages:()=>{
   }
   function fmtTime(ts){
     try{
-      const d=_parseTs(ts);
+      /* Apply S.clockOffset (the Clock Adjustment) the SAME way NOW() does,
+         so message times track the corrected header clock. Without this,
+         setting the clock fixed the header but left every message time off
+         by the offset — "an hour behind on messages". */
+      const d=new Date(_parseTs(ts).getTime()+((typeof S!=='undefined'&&S.clockOffset)||0));
       return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
     }catch(e){return '';}
   }
   function fmtDate(ts){
     try{
-      const d=_parseTs(ts);
-      const n=new Date();
+      const off=((typeof S!=='undefined'&&S.clockOffset)||0);
+      const d=new Date(_parseTs(ts).getTime()+off);
+      const n=new Date(Date.now()+off);
       if(d.toDateString()===n.toDateString()) return 'Today';
       const y=new Date(n);y.setDate(n.getDate()-1);
       if(d.toDateString()===y.toDateString()) return 'Yesterday';
@@ -51358,6 +51806,49 @@ BUILDERS.browser=()=>{
     const grid=el('div',{className:'br-picks'});
     PICKS.forEach(p=>{const b=el('div',{className:'br-pick'});b.textContent=p.label;b.onclick=()=>go(p.url);grid.appendChild(b);});
     ov.appendChild(grid);
+
+    /* ── My Shortcuts ── save any site as a named tile (top community
+       request — "enter a URL & decide a name for it"). Persisted in
+       S.brShortcuts and synced with normal state. */
+    const shHdr=el('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',margin:'18px 0 8px',gap:'8px'}});
+    shHdr.appendChild(txt('h3','My Shortcuts',{style:{margin:'0'}}));
+    const addBtn=txt('button','+ Add site',{className:'btn small'});
+    shHdr.appendChild(addBtn);
+    ov.appendChild(shHdr);
+    const shGrid=el('div',{className:'br-picks'});
+    ov.appendChild(shGrid);
+    function renderShortcuts(){
+      shGrid.innerHTML='';
+      const list=Array.isArray(S.brShortcuts)?S.brShortcuts:[];
+      if(!list.length){
+        shGrid.appendChild(txt('div','No shortcuts yet — tap "+ Add site" to save any page with a name you choose.',{style:{gridColumn:'1/-1',fontSize:'11px',color:'var(--muted)',lineHeight:'1.5',padding:'2px'}}));
+        return;
+      }
+      list.forEach((s,i)=>{
+        const b=el('div',{className:'br-pick',style:{position:'relative',paddingRight:'24px'}});
+        b.textContent=s.name||hostOf(s.url);
+        b.title=s.url;
+        b.onclick=()=>go(s.url);
+        const x=el('button',{type:'button',style:{position:'absolute',top:'4px',right:'4px',width:'18px',height:'18px',lineHeight:'16px',padding:'0',borderRadius:'50%',border:'var(--thin)',background:'var(--bg)',color:'var(--muted)',fontSize:'12px',fontWeight:'900',cursor:'pointer'}});
+        x.textContent='×';x.title='Remove';
+        x.onclick=ev=>{ev.stopPropagation();const j=S.brShortcuts.indexOf(s);if(j<0)return;S.brShortcuts.splice(j,1);save();renderShortcuts();};
+        b.appendChild(x);
+        shGrid.appendChild(b);
+      });
+    }
+    addBtn.onclick=()=>{
+      kindlePrompt('Web address (e.g. booky.io)','',function(url){
+        if(!url)return;
+        const norm=normalize(url);
+        if(!norm){toast('That doesn\'t look like a web address.',2500);return;}
+        kindlePrompt('Name this shortcut',hostOf(norm),function(name){
+          if(!S.brShortcuts)S.brShortcuts=[];
+          S.brShortcuts.push({name:String(name||hostOf(norm)).slice(0,40),url:norm});
+          save();renderShortcuts();toast('Shortcut saved.',1800);
+        });
+      });
+    };
+    renderShortcuts();
     stage.appendChild(ov);
   }
 
@@ -51777,8 +52268,17 @@ BUILDERS.games=()=>{
     setTimeout(()=>waitAndPlace(15),s.view?150:30);
   }
 
-  function show(){cur=0;card.style.display='block';render();}
-  function hide(){card.style.display='none';hl.style.display='none';arrow.style.display='none';navTo('home');}
+  /* KindleOS is its own surface with its own tour. This App-mode tour
+     navigates between #app views (navTo→showView), which fights KindleOS's
+     full-app state — and hide()'s navTo('home') was dumping the user onto
+     the launcher when they closed it. So: never run this tour while
+     KindleOS is mounted, and never navigate views to close it there. */
+  function _kdActive(){try{return !!document.getElementById('kd-root');}catch(_){return false;}}
+  function show(){
+    if(_kdActive()){S.tutorialSeen=true;try{save();}catch(_){}return;}
+    cur=0;card.style.display='block';render();
+  }
+  function hide(){card.style.display='none';hl.style.display='none';arrow.style.display='none';if(!_kdActive())navTo('home');}
 
   nextBtn.onclick=()=>{if(cur<STEPS.length-1){cur++;render();}else{hide();S.tutorialSeen=true;save();}};
   prevBtn.onclick=()=>{if(cur>0){cur--;render();}};
@@ -53814,6 +54314,8 @@ function init(){
 
 /* Module-level so window._khKeyboard.refresh can reach it */
 function isLandscape(){
+  /* App-level soft rotation counts as landscape (landscape mode v2). */
+  try{var _rr=document.getElementById('rotateRoot');if(_rr&&_rr.getAttribute('data-rotated')==='1')return true;}catch(_){}
   /* Prefer screen.orientation / window.orientation — those report *device*
      orientation and are immune to a soft keyboard shrinking the viewport.
      Comparing innerWidth/innerHeight was wrong: when the OS keyboard pops
