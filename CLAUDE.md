@@ -70,10 +70,23 @@ network calls, minimal repaints (e-ink flashes on every DOM write), no reliance 
 
 ## Deploy / "how do I get the changes"
 1. Merge the open PR for branch `claude/wonderful-clarke-6hm5ex` into `main` (GitHub → Merge).
-2. Download `index.html` from `main` and upload to the host.
+2. Download **`index.min.html`** from `main`, rename it to `index.html`, and upload to the host. (It's the
+   minified deploy build — ~22% smaller than the source, so it parses/loads faster on the Kindle. The
+   readable source you edit is still `index.html`.)
 3. Site is behind **Cloudflare** — if changes don't show, **Purge Everything** (cache).
 4. For real internet email: deploy `email-worker.js` (full setup guide in its header), paste its URL into
    Admin → Local Insights → Mail gateway (`localStorage['kh_mail_gateway']`).
+
+## ⚠ Minified deploy build (`index.min.html`)
+- **`index.html` = readable source you EDIT. `index.min.html` = generated deploy artifact you UPLOAD.**
+- After ANY edit to `index.html`, regenerate: `cd tools && npm install && node minify.mjs` (writes
+  `../index.min.html`). Commit both. The minifier (`tools/minify.mjs`) extracts each real `<script>`/`<style>`
+  block (a tiny scanner that skips `<!-- -->` comments — needed because `<script>` appears as text in HTML
+  comments AND in JS template literals, which breaks every off-the-shelf HTML minifier) and minifies bodies
+  with terser (`compress:false, mangle:false` — comments+whitespace ONLY, so cross-`<script>` globals + inline
+  `onclick` can't break) + clean-css L1. Validate after: load `index.min.html` headless, build all views,
+  check no pageerrors. NEVER hand-edit `index.min.html`.
+
 
 ## Feature status
 DONE: Mail (internal + external via worker, KHI summarise/draft/polish, folders, search, avatars),
