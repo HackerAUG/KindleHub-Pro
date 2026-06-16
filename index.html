@@ -26702,8 +26702,9 @@ home:()=>{
     cdForm.appendChild(cdNameInp);cdForm.appendChild(cdDateInp);cdForm.appendChild(cdBtnRow);
     cdSection.appendChild(cdForm);
     addCdBtn.onclick=()=>{cdForm.style.display=cdForm.style.display==='none'?'block':'none';};
+    let _cdEls=[];
     function renderCd(){
-      cdList.innerHTML='';
+      cdList.innerHTML='';_cdEls=[];
       const cds=loadCountdowns();
       if(!cds.length){
         cdList.appendChild(txt('div','No countdowns yet. Tap + Add.',{style:{fontSize:'11px',color:'var(--muted)',fontStyle:'italic'}}));
@@ -26716,7 +26717,9 @@ home:()=>{
         left.appendChild(txt('div',c.name,{style:{fontSize:'12px',fontWeight:'700',lineHeight:'1.3'}}));
         left.appendChild(txt('div',new Date(c.target).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'}),{style:{fontSize:'10px',color:'var(--muted)'}}));
         const right=el('div',{style:{textAlign:'right',flexShrink:'0'}});
-        right.appendChild(txt('div',str,{style:{fontFamily:'monospace',fontWeight:'900',fontSize:'13px',color:done?'var(--success)':'var(--fg)'}}));
+        const strEl=txt('div',str,{style:{fontFamily:'monospace',fontWeight:'900',fontSize:'13px',color:done?'var(--success)':'var(--fg)'}});
+        right.appendChild(strEl);
+        _cdEls.push({strEl:strEl,target:c.target});
         const del=txt('button','x',{style:{fontSize:'10px',background:'none',border:'none',color:'var(--muted)',cursor:'pointer',padding:'0 2px',marginTop:'2px',display:'block',marginLeft:'auto'}});
         del.onclick=()=>{const cds2=loadCountdowns();cds2.splice(i,1);saveCountdowns(cds2);renderCd();};
         right.appendChild(del);
@@ -26724,9 +26727,20 @@ home:()=>{
         cdList.appendChild(row);
       });
     }
+    /* Per-second tick updates ONLY the countdown text (guarded) instead of
+       tearing down + rebuilding all 4 rows every second — that full innerHTML
+       rebuild was a per-second e-ink flash + GC churn on the home screen. */
+    function tickCd(){
+      for(let i=0;i<_cdEls.length;i++){
+        const c=_cdEls[i],r=fmtDiff(c.target);
+        if(c.strEl.textContent!==r.str)c.strEl.textContent=r.str;
+        const col=r.done?'var(--success)':'var(--fg)';
+        if(c.strEl.style.color!==col)c.strEl.style.color=col;
+      }
+    }
     renderCd();
-    // Live tick every second
-    let cdIv=setInterval(()=>{if(!document.contains(cdList)){clearInterval(cdIv);return;}if(document.hidden)return;renderCd();},1000);
+    // Live tick every second (text only — see tickCd)
+    let cdIv=setInterval(()=>{if(!document.contains(cdList)){clearInterval(cdIv);return;}if(document.hidden)return;tickCd();},1000);
     briefCard.appendChild(cdSection);
   })();
   // Quick news headlines from cache

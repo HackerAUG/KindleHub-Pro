@@ -111,8 +111,8 @@ PENDING / bigger jobs (each its own session):
   flash + GC churn each second. Build the structure once, then tick ONLY the changing text (guarded). World
   Clock is the canonical example: `renderClocks()` builds cards into the in-scope `grid` ref (works while the
   view is still detached during build — using `document.getElementById` there silently no-ops and caused a 1s
-  empty-grid flash on entry); `tickClocks()` updates just the time/date text. Same anti-pattern still lives in
-  the home countdown widget (`renderCd`) — left alone for now (only 4 rows, shared widget area).
+  empty-grid flash on entry); `tickClocks()` updates just the time/date text. The home countdown widget
+  (`renderCd`/`tickCd`) now follows the same build-once + tick-text pattern.
 - Per-keystroke `oninput` that re-renders a list = laggy e-ink typing — wrap in `khDebounce(fn,~200)` (RSS
   headline search, science glossary `paint`, Sheets Find now do). Leave live single-cell edits / word-counters
   un-debounced (instant feedback, cheap).
