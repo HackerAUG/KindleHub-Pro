@@ -1098,6 +1098,7 @@ body.launcher-ui .view{padding-bottom:80px;}
     <div class="tab" data-view="wikipedia" style="display:none">Wikipedia</div>
     <div class="tab" data-view="cookbook">Cookbook</div>
     <div class="tab" data-view="files">Files</div>
+    <div class="tab" data-view="screenshot">Screenshot</div>
     <div class="tab" data-view="mail">Mail</div>
     <div class="tab nav-essential" data-view="settings">Settings</div>
   </nav>
@@ -2060,7 +2061,7 @@ const NAV_TABS=[
   ['notes','Notes'],['slides','Slides'],['sheets','Sheets'],['starmap','Stars'],['browser','Browser'],
   ['periodic','Elements'],['formulas','Formulas'],['science','Science'],
   ['sleeplog','Sleep'],['qrgen','QR Code'],
-  ['wikipedia','Wikipedia'],['cookbook','Cookbook'],['files','Files'],['mail','Mail']
+  ['wikipedia','Wikipedia'],['cookbook','Cookbook'],['files','Files'],['screenshot','Screenshot'],['mail','Mail']
 ];
 function getNavOrder(){
   /* Return saved order, but always include any NAV_TABS missing from it
@@ -2380,6 +2381,41 @@ window.khOpenBookReader=(function(){
 
   return openReader;
 })();
+
+/* ── Screenshot capture ───────────────────────────────────────────────
+   Take a PNG screenshot of the LIVE page (no file upload) via html2canvas,
+   lazy-loaded on first use so it never costs boot time. Shots are kept in
+   memory for the session only — data URLs are big, so (like the Free Library
+   book text) they are NEVER written to S/localStorage. Entry points: the
+   "📷 Screenshot this page" button in the Recent/multitask panel, and the
+   Screenshot view. Captures #app, so it's an App-mode feature (in KindleOS,
+   use the device's built-in screenshot). */
+window._khShots=window._khShots||[];
+window.khCaptureScreen=function(target,name){
+  return new Promise(function(resolve){
+    var elx=(typeof target==='string')?document.querySelector(target):target;
+    elx=elx||document.getElementById('app')||document.body;
+    function shoot(){
+      try{
+        var bg='#ffffff';try{bg=getComputedStyle(document.body).backgroundColor||'#ffffff';}catch(_){}
+        window.html2canvas(elx,{backgroundColor:bg,useCORS:true,logging:false,scale:Math.min(2,window.devicePixelRatio||1)}).then(function(canvas){
+          var url=null;try{url=canvas.toDataURL('image/png');}catch(_){url=null;}
+          if(url){
+            window._khShots.unshift({name:name||('Screenshot · '+new Date().toLocaleString()),url:url,at:Date.now()});
+            if(window._khShots.length>30)window._khShots.length=30;
+          }
+          resolve(url);
+        }).catch(function(){resolve(null);});
+      }catch(e){resolve(null);}
+    }
+    if(window.html2canvas){shoot();return;}
+    if(typeof loadVendorScript==='function'&&navigator.onLine!==false){
+      loadVendorScript('https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js')
+        .then(function(){window.html2canvas?shoot():resolve(null);})
+        .catch(function(){resolve(null);});
+    }else{resolve(null);}
+  });
+};
 
 /* ── KindleHub custom dropdown ───────────────────────────────────────
    Replaces native <select> rendering with a tap-friendly button that
@@ -11348,6 +11384,19 @@ function _khOpenMultitask(){
   const box=el('div',{style:{background:'var(--card)',border:'var(--border)',borderRadius:'12px',padding:'14px',width:'100%',maxWidth:'440px',maxHeight:'80vh',overflowY:'auto',boxShadow:'var(--shadow-md)'}});
   box.appendChild(txt('h3','Activities & split screen',{style:{margin:'0 0 4px',fontFamily:'var(--title-font)'}}));
   box.appendChild(txt('p','Tap a name to open it. Tap ⊞ Split to show it beside the current page — two pages at once.',{style:{fontSize:'11px',color:'var(--muted)',margin:'0 0 10px',lineHeight:'1.5'}}));
+  /* Screenshot the page you're currently on (closes this panel first so it
+     isn't in the shot). Saved to the Screenshot page to view/download. */
+  const _shotBtn=txt('button','📷 Screenshot this page',{className:'btn small',style:{width:'100%',marginBottom:'10px'}});
+  _shotBtn.onclick=()=>{
+    ov.remove();
+    if(typeof toast==='function')toast('Capturing…',1500);
+    setTimeout(()=>{
+      (window.khCaptureScreen?window.khCaptureScreen('#app','Screenshot · '+_viewLabel(currentView)):Promise.resolve(null)).then(url=>{
+        if(typeof toast==='function')toast(url?'Saved — open the Screenshot page to view/download.':'Couldn’t capture (needs internet the first time).',url?3800:4200);
+      });
+    },350);
+  };
+  box.appendChild(_shotBtn);
   if(_splitOn){
     const banner=el('div',{style:{display:'flex',alignItems:'center',gap:'6px',flexWrap:'wrap',padding:'8px 10px',background:'var(--highlight)',borderRadius:'8px',marginBottom:'10px'}});
     banner.appendChild(txt('span','Split on: ▣ '+_viewLabel(currentView)+'  +  '+_viewLabel(_splitSecondary),{style:{flex:'1',fontSize:'12px',fontWeight:'800',minWidth:'140px'}}));
@@ -34202,6 +34251,13 @@ settings:()=>{
       hdr.appendChild(txt('strong','KindleHub Ultra',{style:{fontSize:'13px'}}));
       if(typeof _khBadgeEl==='function'){const bd=_khBadgeEl(p.tier);if(bd)hdr.appendChild(bd);}
       _ultraBox.appendChild(hdr);
+      /* Plain-language answer to "am I an admin?" so users can self-check
+         instead of asking. Admins are the `creator` tier. */
+      if(p.tier==='creator'){
+        _ultraBox.appendChild(txt('div','✓ You ARE an admin — you have the moderation + admin tools.',{style:{fontSize:'12px',fontWeight:'800',color:'var(--success)',marginBottom:'4px'}}));
+      }else{
+        _ultraBox.appendChild(txt('div','You are a standard member — not an admin.',{style:{fontSize:'12px',color:'var(--muted)',marginBottom:'4px'}}));
+      }
       const tierName=p.tier==='creator'?'Creator (permanent)':(p.tier==='ultra'?'Ultra — active':'Pro');
       _ultraBox.appendChild(txt('div','Your tier: '+tierName,{style:{fontSize:'12px',fontWeight:'700',marginBottom:'4px'}}));
       if(p.tier!=='creator'){
@@ -34224,6 +34280,10 @@ settings:()=>{
       _ultraBox.appendChild(rf);
     }
     _renderUltra();
+    /* Make sure admin status is actually resolved so the line above is right
+       (a fresh session may not have run _checkAdmin yet); it dispatches
+       kh-tier-changed on resolve, which re-renders via _onTierChange below. */
+    try{if(typeof _checkAdmin==='function')_checkAdmin();}catch(_){}
     /* Re-render when the tier resolves later (e.g. admin detected after a
        post-boot login) so this card never gets stuck showing "Pro". The
        listener self-removes once the card leaves the DOM. */
@@ -45060,6 +45120,75 @@ mail:()=>{
   noteCard.innerHTML='<b style="color:var(--fg)">Why not a full inbox here?</b><br>Gmail, Outlook and the others all send <code>X-Frame-Options: DENY</code> in their HTTP headers, which (by design) blocks any embedded view — including in iframes inside KindleHub. A native client would need OAuth2 with a registered Google/Microsoft Cloud project plus a server-side credentials store, which a single-file static app like this can\'t safely provide. So instead we focus on launching the official apps as fast as possible.';
   v.appendChild(noteCard);
 
+  return v;
+},
+
+screenshot:()=>{
+  const v=el('section',{id:'view-screenshot',className:'view'});
+  v.appendChild(txt('h2','Screenshot',{style:{fontFamily:'var(--title-font)',fontSize:'16px',marginBottom:'4px'}}));
+  v.appendChild(txt('p','Capture any KindleHub page as an image — no file upload. Captures are kept for this session; tap one to view full-size and download. (First capture downloads a small helper, so it needs internet once.)',{style:{fontSize:'12px',color:'var(--muted)',lineHeight:'1.55',marginBottom:'10px'}}));
+  const row=el('div',{style:{display:'flex',gap:'6px',flexWrap:'wrap',marginBottom:'6px'}});
+  const capPrev=txt('button','📷 Capture last page',{className:'btn primary small'});
+  const capApp=txt('button','📷 Capture this screen',{className:'btn small'});
+  row.append(capPrev,capApp);
+  v.appendChild(row);
+  v.appendChild(txt('p','Tip: from any page, tap Recent (top-right) → “📷 Screenshot this page”.',{style:{fontSize:'11px',color:'var(--muted)',marginBottom:'10px'}}));
+  const grid=el('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(130px,1fr))',gap:'8px'}});
+  v.appendChild(grid);
+  function renderShots(){
+    grid.innerHTML='';
+    const shots=window._khShots||[];
+    if(!shots.length){grid.appendChild(txt('div','No screenshots yet. Capture one above, or from any page tap Recent → 📷.',{style:{gridColumn:'1/-1',fontSize:'12px',color:'var(--muted)',padding:'14px',textAlign:'center'}}));return;}
+    shots.forEach(shot=>{
+      const cell=el('div',{style:{position:'relative',border:'var(--thin)',borderRadius:'8px',overflow:'hidden',background:'var(--card)',cursor:'pointer'}});
+      const im=el('img',{src:shot.url,style:{width:'100%',display:'block'}});
+      im.onclick=()=>showFull(shot);
+      cell.appendChild(im);
+      const x=txt('button','×',{style:{position:'absolute',top:'3px',right:'3px',width:'22px',height:'22px',lineHeight:'20px',padding:'0',borderRadius:'50%',border:'none',background:'rgba(0,0,0,0.6)',color:'#fff',fontSize:'14px',fontWeight:'900',cursor:'pointer'}});
+      x.onclick=ev=>{ev.stopPropagation();const i=window._khShots.indexOf(shot);if(i>=0)window._khShots.splice(i,1);renderShots();};
+      cell.appendChild(x);
+      grid.appendChild(cell);
+    });
+  }
+  function showFull(shot){
+    const ov=el('div',{style:{position:'fixed',left:'0',top:'0',right:'0',bottom:'0',background:'rgba(0,0,0,0.92)',zIndex:'600200',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'10px',gap:'10px'}});
+    const im=el('img',{src:shot.url,style:{maxWidth:'100%',maxHeight:'80%',objectFit:'contain',background:'#fff'}});
+    const bar=el('div',{style:{display:'flex',gap:'8px',flexWrap:'wrap',justifyContent:'center'}});
+    const dl=el('a',{href:shot.url,download:String(shot.name||'screenshot').replace(/[^a-z0-9]+/gi,'_').slice(0,40)+'.png',className:'btn small primary'});dl.textContent='Download PNG';
+    const cl=txt('button','Close',{className:'btn small'});cl.onclick=()=>ov.remove();
+    bar.append(dl,cl);
+    ov.append(im,bar);ov.onclick=e=>{if(e.target===ov)ov.remove();};
+    document.body.appendChild(ov);
+  }
+  function busy(on){capPrev.disabled=on;capApp.disabled=on;}
+  capApp.onclick=()=>{
+    busy(true);if(typeof toast==='function')toast('Capturing…',1500);
+    (window.khCaptureScreen?window.khCaptureScreen('#app','Screenshot · Screenshot page'):Promise.resolve(null)).then(url=>{
+      busy(false);renderShots();
+      if(typeof toast==='function')toast(url?'Captured.':'Couldn’t capture (needs internet the first time).',url?1600:4200);
+    });
+  };
+  capPrev.onclick=()=>{
+    const prev=(window._khRecentViews||[]).filter(x=>x&&x!=='screenshot')[0];
+    if(!prev||typeof BUILDERS[prev]!=='function'){if(typeof toast==='function')toast('Open another page first, then come back here.',3200);return;}
+    /* Build the previous page OFF-screen (opaque, so html2canvas renders it),
+       capture, then remove it. */
+    let host=null,node=null;
+    try{node=BUILDERS[prev]();}catch(e){node=null;}
+    if(!node){if(typeof toast==='function')toast('Could not build that page.',3000);return;}
+    const w=(document.getElementById('mainHost')||{}).clientWidth||window.innerWidth||600;
+    host=el('div',{style:{position:'fixed',left:'-99999px',top:'0',width:w+'px',background:'var(--bg,#fff)',padding:'8px',boxSizing:'border-box'}});
+    host.appendChild(node);document.body.appendChild(host);
+    busy(true);if(typeof toast==='function')toast('Capturing '+_viewLabel(prev)+'…',1800);
+    setTimeout(()=>{
+      (window.khCaptureScreen?window.khCaptureScreen(host,'Screenshot · '+_viewLabel(prev)):Promise.resolve(null)).then(url=>{
+        busy(false);try{document.body.removeChild(host);}catch(_){}
+        renderShots();
+        if(typeof toast==='function')toast(url?('Captured '+_viewLabel(prev)+'.'):'Couldn’t capture (needs internet the first time).',url?1800:4200);
+      });
+    },550);
+  };
+  renderShots();
   return v;
 },
 

@@ -31,6 +31,14 @@ network calls, minimal repaints (e-ink flashes on every DOM write), no reliance 
   panes (`#kh-pane-primary-body` / `#kh-pane-secondary-body`); `showView` mounts the PRIMARY via `_viewHost()`
   and the bottom nav drives it. Safe only because inner element IDs are unique per view — NEVER allow the same
   view in both panes (navigating primary onto the secondary's view auto-swaps instead).
+- **Screenshot app**: `window.khCaptureScreen(target,name)` (defined right after the reader IIFE) lazy-loads
+  html2canvas (jsdelivr) on first use, renders the live DOM (default `#app`) to a PNG, and pushes
+  `{name,url,at}` onto `window._khShots` — session-only, NEVER in S (data URLs are huge, same rule as book
+  text). Entry points: the `_khOpenMultitask` panel's "📷 Screenshot this page" (captures the current page)
+  and `BUILDERS.screenshot` (gallery + Download PNG; "Capture last page" rebuilds the previous view off-screen).
+  App-mode only (captures `#app`; in KindleOS use the device screenshot). Replaced the old upload-files Gallery.
+- **Admin self-check**: Settings → Account (`_renderUltra`) states plainly "✓ You ARE an admin" (creator tier)
+  vs "not an admin", and calls `_checkAdmin()` so the tier resolves; re-renders on `kh-tier-changed`.
 - **Free Library / reader**: `window.khOpenBookReader(meta)` + `window.khGutenSearch(q)` (defined right after the
   `el()/txt()` helpers). Search = Gutendex JSON (CORS-open); book text via gutenberg.org through the
   allorigins/corsproxy fallbacks (no CORS header on gutenberg). Full-screen `#kh-reader` overlay paginates
