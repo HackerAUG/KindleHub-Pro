@@ -116,7 +116,9 @@ network calls, minimal repaints (e-ink flashes on every DOM write), no reliance 
 ## Feature status
 DONE: Mail (internal + external via worker, KHI summarise/draft/polish, folders, search, avatars),
 Recent-activities switcher
-(header "Recent" button = lightweight "minimise/jump between activities"), landscape mode v2,
+(header "Recent" button = lightweight "minimise/jump between activities"), landscape mode v2 (rotates
+`#rotateRoot` 90° — but ONLY when the viewport is portrait; on a wider-than-tall screen, e.g. a laptop,
+`toggleLandscape` skips the rotation instead of turning everything sideways),
 offline login + username prefill, website shortcuts (browser New-Tab), Contributors card, Ultra progress,
 admin Local Insights, Team Sudoku (share/load puzzle code), Flight Sim "How to fly", profile avatar+status,
 feedback 7-day auto-prune, app-maker double-install guard,

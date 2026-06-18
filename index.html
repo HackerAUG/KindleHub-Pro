@@ -5309,8 +5309,19 @@ function toggleLandscape(forceTo){
     rr.removeAttribute('data-rotated');
     rr.style.cssText='width:100%;height:100%;position:relative;';
     document.body.style.overflow='';
-    if(btn){btn.textContent='Landscape';btn.classList.remove('primary');}
+    if(btn){btn.textContent='⟳';btn.classList.remove('primary');}
     S.landscapeMode=false;
+  }else if(window.innerWidth>window.innerHeight){
+    /* Screen is ALREADY wider than tall (laptop/desktop, or a Kindle held
+       sideways). Rotating 90° here would just turn everything sideways — the
+       bug in the report. Landscape rotation only makes sense on a PORTRAIT
+       device, so keep the normal already-wide layout instead. */
+    rr.removeAttribute('data-rotated');
+    rr.style.cssText='width:100%;height:100%;position:relative;';
+    document.body.style.overflow='';
+    if(btn){btn.textContent='⟳';btn.classList.remove('primary');}
+    S.landscapeMode=false;
+    if(forceTo===undefined&&typeof toast==='function')toast('Your screen is already wide — landscape rotation is only for a Kindle held upright (portrait).',4500);
   }else{
     const pw=window.innerWidth,ph=window.innerHeight;
     window._lsW=pw;window._lsH=ph;/* lets the resize handler tell a real viewport change from our own synthetic resize event */
@@ -5319,7 +5330,7 @@ function toggleLandscape(forceTo){
       'transform-origin:top left','transform:rotate(90deg) translateY(-'+pw+'px)',
       'overflow:hidden','background:var(--bg)'].join(';');
     document.body.style.overflow='hidden';
-    if(btn){btn.textContent='Portrait';btn.classList.add('primary');}
+    if(btn){btn.textContent='⟳';btn.classList.add('primary');}
     S.landscapeMode=true;
   }
   save();
