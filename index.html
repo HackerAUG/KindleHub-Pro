@@ -3255,8 +3255,14 @@ function launchKindleDesktop(){
       fr.style.cssText='flex:1;width:100%;border:none;background:#fff;display:block;min-height:0;';
       fr.srcdoc=app.customHTML;
       frWrap.appendChild(fr);
-      /* Hide the launcher, show the back FAB */
+      /* Hide the launcher AND the main #app shell behind the overlay. On old
+         Silk, position:fixed coverage of #kd-customapp can leave gaps that let
+         #app's current view (home / messages / global chat) show THROUGH the
+         custom app — that's the "open one made app, see three apps" report.
+         Hiding everything behind the overlay guarantees only the custom app is
+         visible regardless of position:fixed quirks; closeApp restores it. */
       kd.style.display='none';
+      try{var _appEl=document.getElementById('app');if(_appEl){_appEl.dataset.kdAppHidden='1';_appEl.style.display='none';}}catch(_){}
       kdBackFab.style.display='flex';
       return;
     }
@@ -3314,6 +3320,8 @@ function launchKindleDesktop(){
     /* Tear down custom-HTML overlay if present */
     const frWrap=document.getElementById('kd-customapp');
     if(frWrap){frWrap.innerHTML='';frWrap.style.display='none';}
+    /* Restore the #app shell if a custom app had hidden it behind the overlay. */
+    try{var _appEl=document.getElementById('app');if(_appEl&&_appEl.dataset.kdAppHidden){_appEl.style.display='';delete _appEl.dataset.kdAppHidden;}}catch(_){}
     /* Restore launcher chrome */
     document.body.classList.remove('kdos-fullapp');
     kdBackFab.style.display='none';
@@ -4086,6 +4094,9 @@ function launchKindleDesktop(){
     try{document.body.classList.remove('kdos-fullapp');}catch(_){}
     try{if(kdBackFab&&kdBackFab.parentNode)kdBackFab.parentNode.removeChild(kdBackFab);}catch(_){}
     try{const _cu=document.getElementById('kd-customapp');if(_cu&&_cu.parentNode)_cu.parentNode.removeChild(_cu);}catch(_){}
+    /* Safety: make sure the #app shell is visible again when leaving KindleOS,
+       in case a custom app had hidden it and we exited without closeApp. */
+    try{var _appEl2=document.getElementById('app');if(_appEl2){_appEl2.style.display='';delete _appEl2.dataset.kdAppHidden;}}catch(_){}
     kd.remove();if(kdSizer&&kdSizer.parentNode)kdSizer.parentNode.removeChild(kdSizer);
     S.desktopMode=false;save();
     try{localStorage.setItem('kh_desktop_mode','0');}catch(e){}
@@ -9378,7 +9389,7 @@ async function _mailSend(toUser,subject,body,replyTo){
     /* Real internet email — relayed through the Cloudflare Worker gateway,
        which sends from username@kindlehub.pro via the email API. */
     const gw=_mailGatewayUrl();
-    if(!gw)throw new Error('Sending to outside addresses isn\'t switched on yet for this KindleHub — the admin needs to deploy the mail gateway (email-worker.js).');
+    if(!gw)throw new Error('Sending to outside addresses isn\'t switched on yet for this KindleHub — the mail gateway (email-worker.js) needs to be deployed first.');
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(to))throw new Error('"'+to+'" doesn\'t look like a valid email address.');
     const r=await fetch(gw+'/send',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({to:to,from_user:_myMailUser(),subject:String(subject||'(no subject)').slice(0,160),body:String(body||'').slice(0,8000)})});
@@ -26535,7 +26546,7 @@ const KINDLEHUB_MANUAL=[
 "",
 "## KindleHub Mail — your @kindlehub.pro address",
 "",
-"Every signed-in user automatically has a mail address: their username followed by @kindlehub.pro. Open the Mail tab to use it like a normal inbox — Inbox, Sent, Archive and Trash folders, Compose, Reply, Forward, and Unsend for mail you sent. To write to someone you only need their KindleHub username. Mail is encrypted in transit and at rest, read/archive state syncs across your devices, and a dot appears on the Mail tab when something new arrives. It delivers between KindleHub accounts out of the box, and once the admin deploys the mail gateway (email-worker.js) it becomes a full internet address: outside mail sent to username@kindlehub.pro lands in your inbox, and Compose accepts any address (e.g. name@gmail.com) — the suffix disappears as you type a full address. Sent internet mail shows in Sent with a Delete-copy option (a delivered email can't be recalled).",
+"Every signed-in user automatically has a mail address: their username followed by @kindlehub.pro. Open the Mail tab to use it like a normal inbox — Inbox, Sent, Archive and Trash folders, Compose, Reply, Forward, and Unsend for mail you sent. To write to someone you only need their KindleHub username. Mail is encrypted in transit and at rest, read/archive state syncs across your devices, and a dot appears on the Mail tab when something new arrives. It delivers between KindleHub accounts out of the box, and once the mail gateway (email-worker.js) is deployed it becomes a full internet address: outside mail sent to username@kindlehub.pro lands in your inbox, and Compose accepts any address (e.g. name@gmail.com) — the suffix disappears as you type a full address. Sent internet mail shows in Sent with a Delete-copy option (a delivered email can't be recalled).",
 "",
 "## Messages — chat groups and history caps",
 "",
