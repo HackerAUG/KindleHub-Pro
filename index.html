@@ -163,6 +163,13 @@ main{display:block;flex:1;overflow-y:auto;-webkit-overflow-scrolling:touch;backg
 #view-browser{padding:0!important;overflow:hidden!important;display:flex;flex-direction:column;background:var(--bg);color:var(--fg);height:100%;min-height:0;}
 .grid{display:grid;gap:var(--gap);grid-template-columns:1fr}
 @media(min-width:760px){.grid{grid-template-columns:1fr 1fr}}
+/* Adaptive: on a wide desktop the Kindle-width UI stretched edge-to-edge and
+   looked sparse. Centre app-mode in a comfortable reading column. KindleOS
+   (#kd-root, a fixed full-screen overlay) is unaffected; a KindleOS app open
+   in the shell (body.kdos-fullapp) keeps full width. */
+@media(min-width:1000px){
+  body:not(.kdos-fullapp) #app{max-width:980px;margin-left:auto;margin-right:auto;border-left:var(--thin);border-right:var(--thin);}
+}
 
 /* ── Cards — better mobile padding & spacing ── */
 .card{
@@ -1319,7 +1326,13 @@ let S=(()=>{try{
     r=new TextDecoder().decode(bytes);
   }
   return Object.assign(defaultState(),JSON.parse(r));
-}catch(e){return defaultState();}})();
+}catch(e){
+  /* An existing blob that we FAILED to read (inflate/parse error) — flag it so
+     _persistState won't clobber the still-on-disk data, letting a reload or
+     re-login recover instead of forcing a fresh logged-out state every time. */
+  try{if(localStorage.getItem(SK))window.__khStateLoadFailed=true;}catch(_){}
+  return defaultState();
+}})();
 /* PERF: keep a tiny pre-paint hints key in sync so the boot script can apply
    theme / uiMode / lite-mode WITHOUT parsing the whole state blob (saves one
    full JSON.parse before first paint on a loaded account). Written here once at
@@ -1368,8 +1381,8 @@ let _syncTimer=null;
 let _periodicTimer=null;
 let _stateDirty=false;          /* true while local state differs from last cloud sync */
 let _lastSyncedHash='';         /* fingerprint of last successfully synced state */
-const _CLOUD_DEBOUNCE_MS=10000; /* 10s after last edit before upload — quota-friendly (settings & stories sync 10s after the last change) */
-const _PERIODIC_SYNC_MS=30000;  /* background pull every 30s */
+const _CLOUD_DEBOUNCE_MS=20000; /* 20s after the LAST edit before upload — coalesces bursts of edits into one upload (was 10s; doubling halves active-editing egress) */
+const _PERIODIC_SYNC_MS=60000;  /* background pull every 60s (was 30s) — chat has its own realtime socket, so 60s cross-device latency is invisible and idle egress halves */
 
 /* Quick non-cryptographic fingerprint so we can tell "did anything change?"
    without re-encrypting the whole state.
@@ -1418,7 +1431,7 @@ function scheduleCloudSync(force=false){
        The _stateDirty flag stays true so the next online tick (or
        a manual Sync Now) will eventually push the queued edits. */
     if(!navigator.onLine)return;
-    _doCloudSync();
+    _doCloudSync(force);
   },force?0:_CLOUD_DEBOUNCE_MS);
 }
 
@@ -1461,9 +1474,19 @@ function scheduleCloudSync(force=false){
   /* Mark as wrapped so a second BUILDER pass can't double-wrap */
   try{Object.defineProperty(localStorage,'__khAutoSyncWrapped',{value:true,enumerable:false,configurable:false});}catch(_){}
 })();
-async function _doCloudSync(){
+async function _doCloudSync(force){
   if(!S.authToken||!S.syncEnabled)return;
   if(!navigator.onLine)return;/* offline → no upload (saves quota & avoids errors) */
+  /* ── EGRESS short-circuit ──
+     If nothing that would be uploaded has changed since our last successful
+     push (same fingerprint), skip the ENTIRE pull+push round-trip. Remote
+     edits from other devices still arrive via the 60s periodic pull, so we
+     lose nothing. This is the big win: the auto-sync wrapper fires on EVERY
+     kh_* localStorage write (caches, UI prefs, no-op re-saves), and most of
+     those don't change the cloud payload — they used to each cost a meta GET
+     + a full-blob PUT. Now they cost zero network. A real edit changes the
+     fingerprint and falls through to the normal merge-and-push below. */
+  if(!force && _lastSyncedHash!==null && _stateFingerprint()===_lastSyncedHash){_stateDirty=false;return;}
   /* ── Pull-before-push ──
      Previously this just blindly pushed local state. When 3 tabs /
      devices edit concurrently, last-push wins and 999/1000 events
@@ -1503,9 +1526,13 @@ async function _doCloudSync(){
    whether you actually read the chat). */
 function _khMarkGroupUnread(code){try{if(code)localStorage.setItem('kh_msg_unread_'+code,'1');}catch(_){}}
 function _khClearGroupUnread(code){try{if(code)localStorage.removeItem('kh_msg_unread_'+code);}catch(_){}}
+/* Advance the background notifier's "last seen" marker to a message the user has
+   actually read in-app. Without this the 45s notifier only advances on its own
+   poll, so it re-toasts messages you already opened and read. */
+function _khMarkGroupSeen(code,id){try{if(code&&id!=null)localStorage.setItem('kh_msg_lastseen_'+code,String(id));}catch(_){}}
 function _khGroupUnread(code){try{return localStorage.getItem('kh_msg_unread_'+code)==='1';}catch(_){return false;}}
 function _khAnyUnread(){try{if(typeof KH_GLOBAL_GROUP_CODE!=='undefined'&&_khGroupUnread(KH_GLOBAL_GROUP_CODE))return true;const gs=(typeof S!=='undefined'&&S.msgGroups)||[];for(let i=0;i<gs.length;i++){if(gs[i]&&gs[i].code&&_khGroupUnread(gs[i].code))return true;}return false;}catch(_){return false;}}
-window._khMarkGroupUnread=_khMarkGroupUnread;window._khClearGroupUnread=_khClearGroupUnread;window._khGroupUnread=_khGroupUnread;window._khAnyUnread=_khAnyUnread;
+window._khMarkGroupUnread=_khMarkGroupUnread;window._khClearGroupUnread=_khClearGroupUnread;window._khGroupUnread=_khGroupUnread;window._khAnyUnread=_khAnyUnread;window._khMarkGroupSeen=_khMarkGroupSeen;
 
 let _msgNotifyTimer=null;
 function _startMessageNotifier(){
@@ -1947,6 +1974,12 @@ function _persistCompressed(json){
   }catch(_){}
 }
 function _persistState(){
+  /* SAFETY: if boot couldn't read an existing saved blob (e.g. a transient
+     gzip-inflate failure under memory pressure on a Kindle), do NOT overwrite
+     it with the reset/default state — that turns a recoverable hiccup into a
+     permanent logout + local data loss. Preserve the blob so a reload (or
+     re-login) recovers the session. Cleared once authLogin succeeds. */
+  if(window.__khStateLoadFailed)return false;
   try{_khTrackDeletions();}catch(_){}
   const json=JSON.stringify(S);          /* a throw here is a serialization bug, not quota */
   let rawOk=false;
@@ -6026,6 +6059,42 @@ $('hideApiBar').onclick=()=>{ $('apiKeyBar').style.display='none'; };
         after insert on kh_errors
         for each row execute function kh_errors_cap_trigger();
 
+      -- v5 STORAGE GUARD: cap kh_scores to the top 100 per game (was UNBOUNDED —
+      -- the single biggest DB-size leak; every score from every user stayed forever)
+      create or replace function kh_scores_cap_trigger()
+        returns trigger language plpgsql security definer as $body$
+      begin
+        delete from kh_scores
+          where game = new.game
+            and id not in (
+              select id from kh_scores
+              where game = new.game
+              order by score desc, date desc
+              limit 100
+            );
+        return null;
+      end;
+      $body$;
+      drop trigger if exists kh_scores_cap on kh_scores;
+      create trigger kh_scores_cap
+        after insert on kh_scores
+        for each row execute function kh_scores_cap_trigger();
+
+      -- v5 STORAGE GUARD: GC presence rows idle > 3 days (sampled on write)
+      create or replace function kh_presence_gc_trigger()
+        returns trigger language plpgsql security definer as $body$
+      begin
+        if (random() < 0.05) then
+          delete from kh_presence where last_seen < now() - interval '3 days';
+        end if;
+        return new;
+      end;
+      $body$;
+      drop trigger if exists kh_presence_gc on kh_presence;
+      create trigger kh_presence_gc
+        before insert or update on kh_presence
+        for each row execute function kh_presence_gc_trigger();
+
       -- Also rate-limit feedback submissions globally (anti-spam)
       create or replace function kh_feedback_rate_trigger()
         returns trigger
@@ -6576,6 +6645,18 @@ async function _loadAllAnnouncements(){
     return Array.isArray(rows)?rows:[];
   }catch(_){return [];}
 }
+/* Turn a raw PostgREST/Supabase error body into a short, human message —
+   never show users the raw {"code":...,"details":...} JSON ("supabase in
+   braces"). Recognises the common cases and otherwise strips the JSON noise. */
+function _sbFriendlyErr(t,status){
+  const s=String(t||'');
+  if(/23502/.test(s))return 'the database is out of date — re-run the latest KindleHub SQL (Admin → Diagnostics) to add the missing column default, then try again';
+  if(/PGRST(202|205)|Could not find/i.test(s))return 'that feature isn\'t set up yet — run the latest SQL, then reload the schema';
+  if(/rate limit/i.test(s))return 'you\'re doing that too fast — wait a moment and retry';
+  if(/duplicate key|23505/i.test(s))return 'that already exists';
+  try{const o=JSON.parse(s);const m=o.message||o.details||o.hint||o.error;if(m)return String(m).replace(/^Failing row contains.*/i,'a required field was missing').slice(0,120);}catch(_){}
+  return s?String(s).replace(/[{}"\[\]]/g,'').slice(0,120):('server error '+(status||'?'));
+}
 async function _announceRpc(fn,body){
   try{
     const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/rpc/'+fn;
@@ -6584,7 +6665,7 @@ async function _announceRpc(fn,body){
     let t='';try{t=await r.text();}catch(_){}
     if(/not authorized/i.test(t))toast('Wrong PIN — not authorised to post.',5000);
     else if(/PGRST202|PGRST205|Could not find/i.test(t))toast('Announcements aren\'t set up yet — run the kh_announcements SQL, then notify pgrst reload schema.',6500);
-    else toast('Failed: '+String(t||('HTTP '+r.status)).slice(0,120),6000);
+    else toast('Couldn\'t post — '+_sbFriendlyErr(t,r.status),6500);
     return false;
   }catch(e){toast('Network error posting announcement.',4000);return false;}
 }
@@ -8797,6 +8878,7 @@ async function authRegister(email,password){
     if(exists)return{success:false,error:'An account with this email already exists.'};
     S.userId=key.slice(0,16);S.authToken=key;S.email=email;S.syncEnabled=true;
     S._encKey=key; /* held in memory only, never persisted */
+    window.__khStateLoadFailed=false;/* authoritative new account — re-enable saves */
     await _saveUser(key,email,_buildSafeState());
     save();
     return{success:true,username:email,adjusted:(email!==_origName)};
@@ -8830,6 +8912,7 @@ async function authLogin(email,password){
           else if(meta.enc&&typeof meta.state==='string'){packed=meta.state;needsMigration=true;}
           else if(meta.state&&typeof meta.state==='object'){
             S.userId=key.slice(0,16);S.authToken=key;S.email=email;S.syncEnabled=true;S._encKey=key;
+            window.__khStateLoadFailed=false;
             if(Object.keys(meta.state).length>0)mergeCloudState(meta.state);
             await _saveUser(key,email,_buildSafeState());
             save();
@@ -8855,6 +8938,7 @@ async function authLogin(email,password){
     const cloudState=await _decryptState(key,packed);
     if(!cloudState)return{success:false,error:'Decryption failed — wrong password?'};
     S.userId=key.slice(0,16);S.authToken=key;S.email=email;S.syncEnabled=true;S._encKey=key;
+    window.__khStateLoadFailed=false;/* re-authenticated — new state is authoritative, re-enable saves */
     /* Refresh the offline cache for this device (and remember the username
        for the login form) even when we signed in from the server. */
     try{_cacheOfflineCred(key,email,packed);}catch(_){}
@@ -11595,6 +11679,7 @@ const GAME_HELP={
   blackjack:{name:'Blackjack',how:'Get closer to 21 than the dealer without going over. Hit for another card, Stand to hold. Face cards are 10; an Ace counts as 1 or 11. The dealer draws to 17. A two-card 21 (Blackjack) pays 3:2. Adjust your bet, then Deal — build the biggest chip stack you can.'},
   crazy8:{name:'Crazy Eights',how:'An Uno-style card game — play the computer or a friend online. Empty your hand first. Play a card that matches the discard by COLOUR (shown by the letter R/Y/G/B and the coloured border) or by NUMBER/symbol. Action cards: Skip and Reverse skip the other player, Draw Two makes them draw 2 and miss a turn. Wild lets you pick the colour; Wild Draw Four also makes them draw 4. Can’t play? Tap the deck to Draw, then play it or Pass. From the start menu choose “Play vs Computer” or “Play Online — 2 players”; online, the host runs the game so each player only ever sees their own hand, and there’s a chat panel to talk.'},
   snake:{name:'Snake',how:'Steer with the arrow keys (or swipe). Eat the food to grow longer and score — but don\'t hit the walls or your own tail.'},
+  slither:{name:'Slither',how:'Drag on the board (or move the mouse / arrow keys) to steer your snake toward where you want to go. Eat the glowing dots to grow longer. Hold Boost for a burst of speed at the cost of a little length. You die if your head hits another snake\'s body or the world edge — but if another snake rams YOU, it dies and drops food. Score = dots eaten.'},
   g2048:{name:'2048',how:'Slide all tiles with arrow keys or swipes. Matching numbers merge and double. Reach 2048 — then keep going for a high score.'},
   tetris:{name:'Tetris',how:'Move and rotate the falling pieces to complete full horizontal lines, which clear and score. It ends if the stack reaches the top.'},
   wordle:{name:'Wordle',how:'Guess the 5-letter word in 6 tries. Green = correct spot, yellow = wrong spot, grey = not in the word.'},
@@ -11886,7 +11971,7 @@ const DigQuest=(function(){
 
   function digDir(){if(input.down)return 'down';if(input.left&&!input.right)return 'left';if(input.right&&!input.left)return 'right';return player.facing>0?'right':'left';}
   function collect(c,tx,ty){
-    if(c==='*'){crystals++;score+=10;}
+    if(c==='*'){crystals++;bank++;score+=10;}/* crystals (the ◆ the HUD/shop name) now bank for upgrades — previously only coins did, so dug crystals never grew your spendable bank */
     else if(c==='K'){keysHave++;score+=50;}
     else if(c==='o'){coins++;bank++;score+=5;}
     else if(c==='D'){drillT=drillSeconds();score+=15;if(typeof toast==='function')toast('Drilling-charm! Stone breaks for '+Math.round(drillT)+'s.');}
@@ -12294,7 +12379,7 @@ const Blackjack=(function(){
     const wrap=el('div',{style:{maxWidth:'460px',margin:'0 auto',padding:'12px',textAlign:'center'}});
     wrap.appendChild(txt('div','Chips: '+chips,{style:{fontWeight:'900',fontSize:'16px',marginBottom:'10px'}}));
     const hideHole=(phase==='player');
-    wrap.appendChild(txt('div','Dealer'+((phand.length&&!hideHole)?' · '+val(dhand):''),{style:{fontSize:'11px',color:'var(--muted)',marginBottom:'4px',letterSpacing:'.5px',textTransform:'uppercase'}}));
+    wrap.appendChild(txt('div','Dealer'+((dhand.length&&!hideHole)?' · '+val(dhand):''),{style:{fontSize:'11px',color:'var(--muted)',marginBottom:'4px',letterSpacing:'.5px',textTransform:'uppercase'}}));
     wrap.appendChild(handRow(dhand,hideHole));
     wrap.appendChild(txt('div','You'+(phand.length?' · '+val(phand):''),{style:{fontSize:'11px',color:'var(--muted)',margin:'12px 0 4px',letterSpacing:'.5px',textTransform:'uppercase'}}));
     wrap.appendChild(handRow(phand,false));
@@ -12677,6 +12762,7 @@ function _doLaunch(g){
     case 'minesweeper':Minesweeper.start();break;
     case 'sudoku':     Sudoku.start();break;
     case 'snake':      Snake.start();break;
+    case 'slither':    Slither.start();break;
     case 'g2048':      G2048.start();break;
     case 'tetris':     Tetris.start();break;
     case 'spaceinv':   _initSpaceInvaders();   SpaceInvaders.start();break;
@@ -12906,7 +12992,9 @@ const Mastermind=(()=>{
         G.lost=true;
         recordStat('mastermind',false,{turns:G.turns});
       }
-      S.games.mastermind={best:(S.games.mastermind&&S.games.mastermind.best)||null,current:G};
+      /* Drop `current` once the game is over so it isn't resumed as an
+         already-finished board next time; keep persisting it mid-game. */
+      S.games.mastermind={best:(S.games.mastermind&&S.games.mastermind.best)||null,...((G.won||G.lost)?{}:{current:G})};
       save();
       render();
     };
@@ -12976,7 +13064,7 @@ const Memory=(()=>{
       C.first=C.second=null;C.busy=false;save();render();
       if(C.matched.every(Boolean)){toast('All matched!');recordStat('memory',true,{time:Date.now()-C.startTime});}
     }else{
-      setTimeout(()=>{C.revealed[C.first]=C.revealed[C.second]=false;C.first=C.second=null;C.busy=false;save();render();},900);
+      {const _a=C.first,_b=C.second,_g=C;setTimeout(()=>{if(_g!==C)return;/* a "New" game during the flip-back delay reassigned C — don't stomp the fresh board */_g.revealed[_a]=_g.revealed[_b]=false;_g.first=_g.second=null;_g.busy=false;save();render();},900);}
     }
   }
   function restore(){const g=S.games.memory&&S.games.memory.current;if(g){C=JSON.parse(JSON.stringify(g));enterImmersive('Memory');render();}else toast('No saved game');}
@@ -13117,7 +13205,7 @@ const TTT=(()=>{
         else if(mode==='2p'){label='Player '+(winner==='X'?'1':'2')+' wins!';}
         else {const isHuman=winner===humanPiece;label=isHuman?'You win!':'AI wins!';}
         toast(label);
-        if(mode==='2p')recordStat('ttt',false,{time:Date.now()-startTime});
+        if(mode==='2p')recordStat('ttt',null,{time:Date.now()-startTime});
         else if(mode==='online')recordStat('ttt',winner===myOnlinePiece,{time:Date.now()-startTime});
         else recordStat('ttt',winner===humanPiece,{time:Date.now()-startTime});
         return true;
@@ -14557,6 +14645,15 @@ const Chess=(()=>{
     const opp=t==='white'?'black':'white';
     for(let r=0;r<8;r++) for(let c=0;c<8;c++){
       if(!b[r][c]||!enemy(b[r][c],t)) continue;  // only opponent pieces
+      // Pawns attack diagonally even onto EMPTY squares — rawMoves only emits a
+      // pawn capture when the diagonal is occupied, so a pawn covering an empty
+      // square (e.g. the king's castling transit square) would be missed. Handle
+      // pawns explicitly so castling-through-check and empty-square control work.
+      if(b[r][c].toLowerCase()==='p'){
+        const pdir=opp==='white'?-1:1;
+        if(r+pdir===sr&&(c-1===sc||c+1===sc)) return true;
+        continue;
+      }
       // Use rawMoves with no ep/cas to avoid infinite castling recursion
       const ms=rawMoves(b,r,c,opp,null,'-');
       if(ms.some(m=>m.r===sr&&m.c===sc)) return true;
@@ -15839,7 +15936,7 @@ const Minesweeper=(()=>{
       ms.firstClick=false;
       if(ms.cells[i]===9){
         for(let j=0;j<ms.cells.length;j++){
-          if(j!==i&&ms.cells[j]===0){
+          if(j!==i&&ms.cells[j]!==9){
             ms.cells[j]=9;ms.cells[i]=0;
             const size=ms.size;
             for(let r=0;r<size;r++)for(let c=0;c<size;c++){
@@ -15892,10 +15989,11 @@ const Wordle=(()=>{
   function getLetterState(letter){
     let best=null;
     for(const attempt of C.attempts){
+      const sc=scoreRow(attempt);/* duplicate-aware, same as the board tiles */
       for(let i=0;i<attempt.length;i++){
         if(attempt[i]!==letter)continue;
-        if(C.answer[i]===letter)return 'correct';
-        if(C.answer.includes(letter))best='present';
+        if(sc[i]==='correct')return 'correct';
+        if(sc[i]==='present')best='present';
         else if(!best)best='absent';
       }
     }return best;
@@ -16072,8 +16170,12 @@ const Sudoku=(()=>{
         let complete=true;
         for(let r=0;r<9&&complete;r++)for(let c=0;c<9&&complete;c++){
           const v=G.fixed[r][c]?G.puzzle[r][c]:G.user[r][c];
-          if(v!==G.solution[r][c])complete=false;
+          if(!v)complete=false;
         }
+        /* Win on ANY valid full grid (no row/col/box conflicts), not only an
+           exact match to one stored solution — puzzles aren't guaranteed unique,
+           so a correct alternate fill must also count as solved. */
+        if(complete&&getConflicts().size>0)complete=false;
         if(complete){render();toast('Sudoku solved!');recordStat('sudoku',true,{time:Date.now()-G.startTime});}else render();
       };
       numpad.appendChild(btn);
@@ -16317,6 +16419,103 @@ const Snake=(()=>{
   return{start,stop};
 })();
 
+/* ── Slither — a slither.io-style snake ───────────────────────────────
+   Real-time canvas game: drag (or move the mouse) to steer, eat dots to
+   grow, dodge the AI snakes and the world edge, hold Boost for speed.
+   Same conventions as the other canvas games (setInterval tick, stop(),
+   _khSubmitScore, immersiveRoot._trackStop for clean teardown). */
+const Slither=(()=>{
+  const VW=360,VH=520,WORLD=1500,SPEED=3.0,BOOST=5.2,TURN=0.26,SEG_GAP=6,FOOD_N=46;
+  let cv,ctx,timer,G,submitted=false,_keyH=null;
+  const me=()=>G&&G.snakes[0];
+  function newSnake(x,y,ai){return {x,y,angle:Math.random()*6.283,target:Math.random()*6.283,path:[{x,y}],len:14,ai:!!ai,boost:false,dead:false};}
+  function spawnFood(n){for(let i=0;i<n;i++)G.food.push({x:Math.random()*WORLD,y:Math.random()*WORLD,r:3+Math.random()*2});}
+  function init(){G={food:[],snakes:[],score:0,active:true};G.snakes.push(newSnake(WORLD/2,WORLD/2,false));for(let i=0;i<3;i++)G.snakes.push(newSnake(Math.random()*WORLD,Math.random()*WORLD,true));spawnFood(FOOD_N);submitted=false;}
+  function aiThink(s){
+    let best=null,bd=1e9;for(const f of G.food){const d=Math.hypot(s.x-f.x,s.y-f.y);if(d<bd){bd=d;best=f;}}
+    if(best&&Math.random()<0.85)s.target=Math.atan2(best.y-s.y,best.x-s.x);else if(Math.random()<0.05)s.target=Math.random()*6.283;
+    const m=90;if(s.x<m)s.target=0;else if(s.x>WORLD-m)s.target=Math.PI;if(s.y<m)s.target=1.571;else if(s.y>WORLD-m)s.target=-1.571;
+    s.boost=false;
+  }
+  function killSnake(s){if(s.dead)return;s.dead=true;for(let i=0;i<s.path.length;i+=2)G.food.push({x:s.path[i].x+(Math.random()*8-4),y:s.path[i].y+(Math.random()*8-4),r:3+Math.random()*2});}
+  function step(){
+    if(!G||!G.active)return;const p=me();
+    G.snakes.forEach(s=>{
+      if(s.dead)return;
+      if(s.ai)aiThink(s);
+      let d=s.target-s.angle;while(d>Math.PI)d-=6.283;while(d<-Math.PI)d+=6.283;
+      s.angle+=Math.max(-TURN,Math.min(TURN,d));
+      const sp=(s.boost&&s.len>16)?BOOST:SPEED;
+      s.x+=Math.cos(s.angle)*sp;s.y+=Math.sin(s.angle)*sp;
+      if(s.boost&&s.len>16){s.len-=0.06;if(Math.random()<0.12)G.food.push({x:s.x-Math.cos(s.angle)*10,y:s.y-Math.sin(s.angle)*10,r:3});}
+      if(s.x<0||s.y<0||s.x>WORLD||s.y>WORLD){killSnake(s);return;}
+      const h=s.path[0];if(!h||Math.hypot(s.x-h.x,s.y-h.y)>=SEG_GAP)s.path.unshift({x:s.x,y:s.y});
+      const maxPts=Math.ceil(s.len)+2;if(s.path.length>maxPts)s.path.length=maxPts;
+      for(let i=G.food.length-1;i>=0;i--){const f=G.food[i];if(Math.hypot(s.x-f.x,s.y-f.y)<11){G.food.splice(i,1);s.len+=1.2;if(!s.ai)G.score++;}}
+    });
+    while(G.food.length<FOOD_N)spawnFood(1);
+    /* head-vs-other-body collisions */
+    G.snakes.forEach(s=>{if(s.dead)return;G.snakes.forEach(o=>{if(o===s||o.dead)return;for(let i=2;i<o.path.length;i++){if(Math.hypot(s.x-o.path[i].x,s.y-o.path[i].y)<6){killSnake(s);return;}}});});
+    if(me().dead){endGame();return;}
+    if(p)updateImmersiveScore('Length '+Math.round(p.len));
+    G.snakes.forEach((s,idx)=>{if(idx>0&&s.dead&&Math.random()<0.02)G.snakes[idx]=newSnake(Math.random()*WORLD,Math.random()*WORLD,true);});
+    draw();
+  }
+  function draw(){
+    if(!ctx||!G)return;const dark=document.body.classList.contains('dark');
+    ctx.fillStyle=dark?'#0b0b0b':'#f4f4f4';ctx.fillRect(0,0,VW,VH);
+    const p=me();const camX=p.x-VW/2,camY=p.y-VH/2;
+    ctx.save();ctx.translate(-camX,-camY);
+    ctx.strokeStyle=dark?'#444':'#bbb';ctx.lineWidth=3;ctx.strokeRect(0,0,WORLD,WORLD);
+    ctx.fillStyle=dark?'#9ad':'#39c';
+    for(const f of G.food){if(f.x<camX-10||f.x>camX+VW+10||f.y<camY-10||f.y>camY+VH+10)continue;ctx.beginPath();ctx.arc(f.x,f.y,f.r,0,6.283);ctx.fill();}
+    G.snakes.forEach(s=>{
+      if(s.dead)return;const r=Math.max(4,3+s.len*0.05);
+      ctx.fillStyle=s.ai?(dark?'#777':'#999'):(dark?'#eee':'#111');
+      for(let i=s.path.length-1;i>=0;i--){const pt=s.path[i];if(pt.x<camX-20||pt.x>camX+VW+20||pt.y<camY-20||pt.y>camY+VH+20)continue;ctx.beginPath();ctx.arc(pt.x,pt.y,r,0,6.283);ctx.fill();}
+      ctx.beginPath();ctx.arc(s.x,s.y,r+1,0,6.283);ctx.fill();
+      if(!s.ai){ctx.fillStyle=dark?'#111':'#fff';ctx.beginPath();ctx.arc(s.x+Math.cos(s.angle+0.5)*r,s.y+Math.sin(s.angle+0.5)*r,1.7,0,6.283);ctx.arc(s.x+Math.cos(s.angle-0.5)*r,s.y+Math.sin(s.angle-0.5)*r,1.7,0,6.283);ctx.fill();}
+    });
+    ctx.restore();
+    ctx.fillStyle=dark?'#888':'#666';ctx.font='12px monospace';ctx.textAlign='left';ctx.fillText('Length '+Math.round(p.len)+'   Food '+G.score,8,18);
+  }
+  function start(){
+    enterImmersive('Slither','');immersiveContent.innerHTML='';
+    cv=document.createElement('canvas');cv.width=VW;cv.height=VH;
+    cv.style.cssText='display:block;max-width:100%;width:100%;border:2px solid var(--fg);touch-action:none;border-radius:8px;background:var(--bg);';
+    immersiveContent.appendChild(cv);ctx=cv.getContext('2d');init();
+    function aim(cx,cy){const rect=cv.getBoundingClientRect();const mx=(cx-rect.left)*(VW/rect.width),my=(cy-rect.top)*(VH/rect.height);if(me())me().target=Math.atan2(my-VH/2,mx-VW/2);}
+    cv.addEventListener('touchmove',e=>{if(e.touches[0]){aim(e.touches[0].clientX,e.touches[0].clientY);e.preventDefault();}},{passive:false});
+    cv.addEventListener('touchstart',e=>{if(e.touches[0])aim(e.touches[0].clientX,e.touches[0].clientY);},{passive:true});
+    cv.addEventListener('mousemove',e=>aim(e.clientX,e.clientY));
+    const ctrl=el('div',{className:'card-row',style:{display:'flex',gap:'8px',justifyContent:'center',marginTop:'10px',flexWrap:'wrap'}});
+    const boostBtn=txt('button','⚡ Boost (hold)',{className:'btn'});
+    const setB=v=>{if(me())me().boost=v;};
+    boostBtn.addEventListener('touchstart',e=>{e.preventDefault();setB(true);},{passive:false});
+    boostBtn.addEventListener('touchend',()=>setB(false));
+    boostBtn.addEventListener('mousedown',()=>setB(true));boostBtn.addEventListener('mouseup',()=>setB(false));boostBtn.addEventListener('mouseleave',()=>setB(false));
+    const newBtn=txt('button','New Game',{className:'btn'});newBtn.onclick=()=>{init();draw();};
+    ctrl.appendChild(boostBtn);ctrl.appendChild(newBtn);immersiveContent.appendChild(ctrl);
+    immersiveContent.appendChild(txt('div','Drag on the board to steer. Eat dots to grow; don\'t ram another snake or the wall. Hold Boost for speed (costs length).',{style:{textAlign:'center',color:'var(--muted)',fontSize:'11px',marginTop:'8px',lineHeight:'1.5'}}));
+    if(_keyH)document.removeEventListener('keydown',_keyH);
+    _keyH=e=>{if(!G||!G.active||!me())return;const m={ArrowLeft:Math.PI,ArrowRight:0,ArrowUp:-1.571,ArrowDown:1.571};if(m[e.key]!==undefined){me().target=m[e.key];e.preventDefault();}};
+    document.addEventListener('keydown',_keyH);
+    if(timer)clearInterval(timer);timer=setInterval(step,1000/18);
+    immersiveRoot._trackStop=()=>stop();draw();
+  }
+  function endGame(){
+    if(!G||!G.active)return;G.active=false;if(timer){clearInterval(timer);timer=null;}
+    if(submitted)return;submitted=true;const sc=G.score;
+    if(!S.games.slither)S.games.slither={best:0};S.games.slither.best=Math.max(S.games.slither.best||0,sc);saveNow();
+    try{_khSubmitScore('slither',sc);}catch(_){}recordStat('slither',false);draw();
+    const msg=txt('div','Game Over! Food eaten: '+sc+'  ·  Length '+Math.round(me().len),{style:{textAlign:'center',fontWeight:'bold',fontSize:'15px',color:'var(--danger)',margin:'8px'}});
+    const ctrl=immersiveContent.querySelector('.card-row');if(ctrl)immersiveContent.insertBefore(msg,ctrl);else immersiveContent.appendChild(msg);
+    toast('Game Over! Food eaten: '+sc);
+  }
+  function stop(){if(timer){clearInterval(timer);timer=null;}if(_keyH){document.removeEventListener('keydown',_keyH);_keyH=null;}}
+  return{start,stop};
+})();
+
 const G2048=(()=>{
   let G=null,saveTimer2048=null;
   const SZ=72, GAP=8, PAD=8; // tile size, gap, board padding
@@ -16412,10 +16611,10 @@ const G2048=(()=>{
     const sb=document.getElementById('g2048sb');
     if(sb)sb.textContent=`Score: ${G.score}   Best: ${G.best}`;
     updateImmersiveScore(`Score: ${G.score}`);
-    if(G.won&&G.active){
+    if(G.won&&G.active&&G.wonShown){
       ctx.fillStyle='rgba(255,255,255,0.15)';ctx.fillRect(0,0,BOARD_PX,BOARD_PX);
       ctx.fillStyle=dark?'#fff':'#000';ctx.font='bold 22px monospace';ctx.textAlign='center';ctx.textBaseline='middle';
-      ctx.fillText('2048!',BOARD_PX/2,BOARD_PX/2);
+      ctx.fillText('2048! Keep going',BOARD_PX/2,BOARD_PX/2);
     }
     if(!G.active){
       ctx.fillStyle='rgba(0,0,0,0.55)';ctx.fillRect(0,0,BOARD_PX,BOARD_PX);
@@ -16447,9 +16646,10 @@ const G2048=(()=>{
       }
     }
     if(!moved)return;
+    if(G.wonShown)G.wonShown=false;/* dismiss the win banner on the next move so it doesn't obscure the board forever */
     G.board=b;addTile();
     if(G.score>G.best){G.best=G.score;S.games['2048']={best:G.best};save();}
-    if(G.board.includes(2048)&&!G.won){G.won=true;toast('You reached 2048!');}
+    if(G.board.includes(2048)&&!G.won){G.won=true;G.wonShown=true;toast('You reached 2048!');}
     if(!G.board.includes(0)){
       let canMove=false;
       for(let r=0;r<4&&!canMove;r++)for(let c=0;c<4&&!canMove;c++){
@@ -16494,7 +16694,7 @@ const Tetris=(()=>{
     nextP=np;
     piece={shape:src.shape.map(r=>[...r]),color:src.color,border:src.border};
     px=Math.floor((COLS-piece.shape[0].length)/2);py=0;
-    if(collide(px,py,piece.shape)){gameOver();}
+    if(collide(px,py,piece.shape)){gameOver();return;}
     drawNextPiece();
   }
   function drawNextPiece(){
@@ -16753,7 +16953,7 @@ function _initSpaceInvaders(){if(SpaceInvaders)return;SpaceInvaders=(()=>{
     const alive=SI.enemies.filter(e=>e.alive);
     if(!alive.length){
       SI.level++;
-      SI.enemies.forEach(e=>{e.alive=true;e.y=28;});
+      SI.enemies.forEach(e=>{e.alive=true;e.y=28+(e.row||0)*26;});
       SI.espeed=Math.min(4,1.2+SI.level*0.25);
       for(const sh of SI.shields)sh.cells.forEach(c=>{
         c.alive=!(c.row>=2&&c.col>=2&&c.col<=5);
@@ -17178,7 +17378,7 @@ function _initTowerDef(){if(TowerDef)return;TowerDef=(()=>{
       if(e.slow>0)e.slow-=dt;
       if(e.burn>0){
         e.burnTimer-=dt;
-        if(e.burnTimer<=0){e.hp-=e.burn;e.burnTimer=0.5;burst(e._wx,e._wy,'#ff6020',2);}
+        if(e.burnTimer<=0){e.hp-=e.burn;e.burnTimer=0.5;burst(e._wx,e._wy,'#ff6020',2);if(e.hp<=0){killEnemy(e,null);return;}}
       }
       if(e.dist>=pathLen){
         e.dead=true;
@@ -17882,7 +18082,10 @@ function _initCheckers(){if(Checkers)return;Checkers=(()=>{
 
     /* If we are in a chain jump, only allow jumping with the same piece */
     if(chainPiece){
-      if(r===chainPiece[0]&&c===chainPiece[1]){sel=null;chainPiece=null;render();return;}
+      /* Mid multi-jump the piece is LOCKED — tapping it just re-selects it (so its
+         remaining jumps stay highlighted) instead of letting the player abandon a
+         mandatory capture chain, which standard checkers requires you to finish. */
+      if(r===chainPiece[0]&&c===chainPiece[1]){sel=[chainPiece[0],chainPiece[1]];render();return;}
       const jump=avail.find(m=>m.r===chainPiece[0]&&m.c===chainPiece[1]&&m.tr===r&&m.tc===c);
       if(jump){executeMove(jump,playerColor);return;}
       return;
@@ -18173,6 +18376,7 @@ function _initDotsBoxes(){if(DotsBoxes)return;DotsBoxes=(()=>{
   let turn=1;          /* 1 or 2 */
   let scores={1:0,2:0};
   let gameOver=false;
+  let _dbCounted=false;/* end-of-game stats recorded once per game, not per render */
   let L=null;          /* container */
   /* Online session — host=player 1, guest=player 2. Pre-game grid size
      is sent as part of the room handshake so both sides match. */
@@ -18250,7 +18454,7 @@ function _initDotsBoxes(){if(DotsBoxes)return;DotsBoxes=(()=>{
     for(let r=0;r<B;r++){const row=[];for(let c=0;c<B-1;c++)row.push(false);hLines.push(row);}
     for(let r=0;r<B-1;r++){const row=[];for(let c=0;c<B;c++)row.push(false);vLines.push(row);}
     for(let r=0;r<B-1;r++){const row=[];for(let c=0;c<B-1;c++)row.push(0);boxes.push(row);}
-    turn=1;scores={1:0,2:0};gameOver=false;
+    turn=1;scores={1:0,2:0};gameOver=false;_dbCounted=false;
   }
 
   /* Try drawing line; returns {claimed:int} where claimed is the number
@@ -18460,12 +18664,16 @@ function _initDotsBoxes(){if(DotsBoxes)return;DotsBoxes=(()=>{
       const winner=scores[1]>scores[2]?'P1':(scores[2]>scores[1]?(mode==='ai'?'AI':'P2'):'Draw');
       msgDiv.textContent=winner==='Draw'?'Draw — '+scores[1]+' to '+scores[2]:winner+' wins — '+scores[1]+' to '+scores[2];
       L.appendChild(msgDiv);
-      /* Stats */
-      if(!S.stats.dotsboxes)S.stats.dotsboxes={played:0};
-      S.stats.dotsboxes.played++;
-      if(!S.games.dotsboxes)S.games.dotsboxes={wins:0};
-      if(winner==='P1')S.games.dotsboxes.wins=(S.games.dotsboxes.wins||0)+1;
-      save();
+      /* Stats — record once per finished game, not on every re-render of the
+         finished board (online re-renders were inflating played/wins). */
+      if(!_dbCounted){
+        _dbCounted=true;
+        if(!S.stats.dotsboxes)S.stats.dotsboxes={played:0};
+        S.stats.dotsboxes.played++;
+        if(!S.games.dotsboxes)S.games.dotsboxes={wins:0};
+        if(winner==='P1')S.games.dotsboxes.wins=(S.games.dotsboxes.wins||0)+1;
+        save();
+      }
       const ng=document.createElement('button');ng.className='btn primary';ng.textContent='New Game';
       ng.style.marginTop='10px';
       ng.onclick=()=>showSetup();
@@ -18904,7 +19112,7 @@ function _initSolitaire(){if(Solitaire)return;Solitaire=(()=>{
 
   function cardAt(x,y){
     for(let i=0;i<4;i++){
-      const fx=4+COL_X(3+i), fy=TOP_Y;
+      const fx=COL_X(3+i), fy=TOP_Y;
       if(x>=fx&&x<=fx+CX&&y>=fy&&y<=fy+CY){return{zone:'foundation',idx:i};}
     }
     const sx=COL_X(0), sy=TOP_Y;
@@ -19309,6 +19517,9 @@ function _initRacer(){ if(Racer)return; Racer=(()=>{
     if(timer)clearInterval(timer);
     lastT=Date.now();
     timer=setInterval(tick,1000/20);
+    /* Stop the race loop on ANY immersive exit (Recent switcher, swipe, etc.) —
+       not just the in-game Exit button — so the 20fps timer can't leak. */
+    try{immersiveRoot._trackStop=function(){if(timer){clearInterval(timer);timer=null;}};}catch(_){}
     draw();
   }
 
@@ -19669,15 +19880,15 @@ function _initFlightSim(){
     mapCan.addEventListener('touchmove',e=>{
       if(!_mapDrag)return;
       const dx=e.touches[0].clientX-_mapDrag.x,dy=e.touches[0].clientY-_mapDrag.y;
-      const scale=(CW/0.5)*_mapZoom;
+      const scale=(CW/0.55)*_mapZoom;
       F.wx=_mapDrag.wx-dx/scale;F.wy=_mapDrag.wy-dy/scale;
     },{passive:true});
     mapCan.addEventListener('touchend',e=>{
       if(_mapDrag&&Date.now()-_mapDrag.t<220){
         const rect=mapCan.getBoundingClientRect();
         const mx=e.changedTouches[0].clientX-rect.left,my=e.changedTouches[0].clientY-rect.top;
-        const scale=(CW/0.5)*_mapZoom;
-        const wp_wx=F.wx+(mx-CW/2)/scale,wp_wy=F.wy+(my-(CH+80)/2)/scale;
+        const scale=(CW/0.55)*_mapZoom;
+        const wp_wx=F.wx+(mx-CW/2)/scale,wp_wy=F.wy+(my-(CH+80-30)/2)/scale;
         /* tap existing WP to remove it */
         const tapR=14/scale;
         const hit=_fpPlan.findIndex(wp=>Math.hypot(wp.wx-wp_wx,wp.wy-wp_wy)<tapR);
@@ -23005,11 +23216,30 @@ function offlineAI(raw){
   return hasAnyKey()?`Thinking… (if you see this, the AI call failed — check your key/model and try again.)`:`I can answer any question with an AI key — go to Settings → AI to add a Gemini key (aistudio.google.com, free) or OpenRouter key (openrouter.ai, has free models).\n\nOffline commands: 'help', 'play snake', 'calc 15*7', 'convert 10km to miles', 'recommend mystery', 'note pick up milk'.`;
 }
 
+/* ── Reply-to-a-message (AI assistant chat) ──────────────────────────
+   Tap "↩ Reply" under any AI (or your own) message to quote/acknowledge
+   it. The quoted snippet shows on your bubble AND rides along to the
+   model as context so it knows exactly which message you mean. */
+let _aiReplyCtx=null;
+function _aiEsc(s){return String(s==null?'':s).replace(/[<>&]/g,function(c){return{'<':'&lt;','>':'&gt;','&':'&amp;'}[c];});}
+function _setAiReply(text,who){
+  _aiReplyCtx={text:String(text||'').replace(/\s+/g,' ').trim().slice(0,400),who:who||'AI'};
+  const strip=document.getElementById('aiReplyStrip'),lbl=document.getElementById('aiReplyStripLabel');
+  if(lbl)lbl.innerHTML='↩ Replying to <b>'+_aiEsc(_aiReplyCtx.who)+'</b>: '+_aiEsc(_aiReplyCtx.text.slice(0,80));
+  if(strip)strip.style.display='flex';
+  const inp=document.getElementById('chatIn');if(inp)inp.focus();
+}
+function _clearAiReply(){_aiReplyCtx=null;const strip=document.getElementById('aiReplyStrip');if(strip)strip.style.display='none';}
+window._setAiReply=_setAiReply;
 async function sendChat(){
   const inp=$('chatIn');if(!inp)return;
   const t=inp.value.trim();if(!t)return;
-  addUserMsg(t);inp.value='';
-  chatHistory.push({role:'user',text:t});
+  const replyCtx=_aiReplyCtx;_clearAiReply();
+  addUserMsg(t,replyCtx);inp.value='';
+  /* Thread the quoted message to the model (not just visually) so it can
+     answer in context; keep the raw text for the local-command parser. */
+  const histText=replyCtx?('[Replying to '+(replyCtx.who||'your')+' message: "'+replyCtx.text.slice(0,240)+'"]\n\n'+t):t;
+  chatHistory.push({role:'user',text:histText});
   saveChatHistory();
   const localResult=tryLocalCommand(t);
   if(localResult!==null){addBotMsg(localResult);chatHistory.push({role:'bot',text:localResult});updateAIMsgCounter();saveChatHistory();return;}
@@ -23483,9 +23713,18 @@ function tryLocalCommand(raw){
   return null;
 }
 
-function addUserMsg(t){
+function addUserMsg(t,replyCtx){
   const l=$('chatLog');if(!l)return;
-  const d=el('div',{className:'msg user'});d.textContent=t;l.appendChild(d);l.scrollTop=l.scrollHeight;
+  if(!replyCtx){
+    const d=el('div',{className:'msg user'});d.textContent=t;l.appendChild(d);l.scrollTop=l.scrollHeight;return;
+  }
+  /* Right-aligned column so the quote line sits above the bubble. */
+  const wrap=el('div',{style:{display:'flex',flexDirection:'column',alignItems:'flex-end',gap:'2px',alignSelf:'flex-end',maxWidth:'88%'}});
+  const q=el('div',{style:{fontSize:'10px',color:'var(--muted)',borderLeft:'3px solid var(--muted)',padding:'2px 8px',background:'var(--highlight)',borderRadius:'4px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',maxWidth:'100%'}});
+  q.textContent='↩ '+(replyCtx.who||'AI')+': '+String(replyCtx.text).slice(0,70);
+  wrap.appendChild(q);
+  const d=el('div',{className:'msg user'});d.textContent=t;wrap.appendChild(d);
+  l.appendChild(wrap);l.scrollTop=l.scrollHeight;
 }
 
 function parseQuizBlock(text){
@@ -23871,6 +24110,17 @@ function addBotMsg(t,isTemp){
     wrap.appendChild(btnRow);
   }
 
+  /* "↩ Reply" — quote this AI message in your next prompt. */
+  if(!isTemp&&displayText){
+    const act=document.createElement('div');
+    act.style.cssText='display:flex;gap:6px;margin:1px 0 2px 4px;';
+    const rb=document.createElement('button');
+    rb.textContent='↩ Reply';rb.className='btn small';
+    rb.style.cssText='font-size:10px;padding:3px 9px;min-height:28px;opacity:.7;';
+    rb.onclick=function(){_setAiReply(displayText,'AI');};
+    act.appendChild(rb);
+    wrap.appendChild(act);
+  }
   l.appendChild(wrap);
   if(quiz&&!isTemp){renderQuizSaveCard(quiz,l);}
   l.scrollTop=l.scrollHeight;
@@ -25401,6 +25651,7 @@ const LightsOut=(()=>{
       margin:'0 auto',
     }});
 
+    const cellEls=[];
     grid.forEach((on,idx)=>{
       const cell=el('div',{style:{
         width:cellSize+'px',height:cellSize+'px',
@@ -25434,6 +25685,7 @@ const LightsOut=(()=>{
           }
         };
       }
+      cellEls[idx]=cell;
       board.appendChild(cell);
     });
     immersiveContent.appendChild(board);
@@ -25445,7 +25697,7 @@ const LightsOut=(()=>{
       const lit=grid.reduce((a,v,i)=>v?[...a,i]:a,[]);
       if(!lit.length)return;
       const idx=lit[Math.floor(Math.random()*lit.length)];
-      const cells=immersiveContent.querySelectorAll('div[style*="border-radius: 6px"]');
+      const cells=cellEls;/* held references — robust vs. fragile style-substring matching */
       if(cells[idx]){cells[idx].style.outline='3px solid #e44';setTimeout(()=>{if(cells[idx])cells[idx].style.outline='';},800);}
     };
     ctrl.appendChild(newBtn);
@@ -25767,7 +26019,7 @@ const WordSearch=(()=>{
     const all=[...pack.words].sort(()=>Math.random()-0.5);
     /* Prefer mix of lengths — drop very long words that won't fit */
     const fit=all.filter(w=>w.length<=pack.size-1);
-    return fit.slice(0,12);
+    return fit.slice(0,14);
   }
 
   /* ── Render ── */
@@ -27224,6 +27476,11 @@ games:()=>{
        height instead of Snake ballooning to 2× the others). */
     if(best)c.appendChild(txt('p','Best: '+best,{style:'font-size:11px;color:var(--muted);margin-top:3px;'}));
     c.appendChild(txt('button','Play',{className:'btn primary','data-game':'snake',style:{marginTop:'6px',width:'100%'}}));
+  }));
+  rowArc.appendChild(gc('Slither',null,c=>{
+    c.appendChild(txt('p','Grow by eating dots, dodge other snakes — slither.io style.',{style:{fontSize:'11px',color:'var(--muted)',marginBottom:'4px'}}));
+    c.appendChild(txt('p','Best: '+(S.games&&S.games.slither&&S.games.slither.best||0),{style:{fontSize:'11px',color:'var(--muted)'}}));
+    c.appendChild(txt('button','Play',{className:'btn primary','data-game':'slither',style:{marginTop:'6px',width:'100%'}}));
   }));
   rowArc.appendChild(gc('Tetris',null,c=>{
     c.appendChild(txt('p','Stack falling pieces. Clear lines to score.',{style:{fontSize:'11px',color:'var(--muted)',marginBottom:'4px'}}));
@@ -29318,6 +29575,14 @@ chat:()=>{
   chatInput.style.flex='1';
   inp.appendChild(chatInput);
   inp.appendChild(txt('button','Send',{className:'btn primary',id:'sendChat'}));
+  /* Reply strip — shows the message you're replying to, above the composer. */
+  _aiReplyCtx=null;
+  const aiReplyStrip=el('div',{id:'aiReplyStrip',style:{display:'none',alignItems:'center',gap:'8px',padding:'6px 10px',borderTop:'var(--thin)',background:'var(--highlight)',fontSize:'11px',flexShrink:'0'}});
+  aiReplyStrip.appendChild(el('div',{id:'aiReplyStripLabel',style:{flex:'1',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',color:'var(--muted)'}}));
+  const aiReplyCancel=txt('button','✕',{className:'btn small',style:{flexShrink:'0',minHeight:'30px',padding:'2px 10px'}});
+  aiReplyCancel.onclick=()=>_clearAiReply();
+  aiReplyStrip.appendChild(aiReplyCancel);
+  chatPanel.appendChild(aiReplyStrip);
   chatPanel.appendChild(inp);
 
   /* Chat footer: kept compact intentionally. The dozens of "skill"
@@ -31450,7 +31715,7 @@ body.sepia #view-weather{--muted:#4a3a26;}
   const WX_ICONS={0:'[sun]',1:'[sun]',2:'[cloud]',3:'[cloud]',45:'[fog]',48:'[fog]',51:'[rain]',53:'[rain]',55:'[rain]',61:'[rain]',63:'[rain]',65:'[rain]',71:'[snow]',73:'[snow]',75:'[snow]',80:'[shower]',81:'[shower]',82:'[storm]',95:'[storm]',96:'[storm]',99:'[storm]'};
   const WX_DESC={0:'Clear sky',1:'Mainly clear',2:'Partly cloudy',3:'Overcast',45:'Fog',48:'Icy fog',51:'Light drizzle',53:'Drizzle',55:'Heavy drizzle',61:'Light rain',63:'Rain',65:'Heavy rain',71:'Light snow',73:'Snow',75:'Heavy snow',80:'Showers',81:'Heavy showers',82:'Violent showers',95:'Thunderstorm',96:'Thunderstorm+hail',99:'Heavy thunderstorm'};
 
-  function wxRender(data,locName,aqData){
+  function wxRender(data,locName,aqData,isFresh){
     _lastWxData=data;_lastWxLocName=locName;_lastAqData=aqData;
     wxOut.innerHTML='';
     const cur=data.current,daily=data.daily,hourly=data.hourly;
@@ -32081,7 +32346,11 @@ body.sepia #view-weather{--muted:#4a3a26;}
           radarWrap.innerHTML='<div style="color:var(--muted);font-size:11px;padding:8px;">Could not load radar. Check connection.</div>';
         });
     };
-    S.weatherData={cur,daily,hourly,locName,aqData:aqData||null,ts:Date.now()};save();
+    /* Only stamp a NEW fetch-time when this is genuinely fresh network data.
+       Re-rendering the cache (paint-first / offline fallback) passed isFresh=false
+       and must NOT clobber ts — doing so reset the stored fetch-time to "now" on
+       every view, which is why the offline label always read "cached 0min ago". */
+    if(isFresh!==false){S.weatherData={cur,daily,hourly,locName,aqData:aqData||null,ts:Date.now()};save();}
   }
 
   async function wxFetch(lat,lon,locName){
@@ -32095,7 +32364,7 @@ body.sepia #view-weather{--muted:#4a3a26;}
     const cache=S.weatherData;
     const cacheAgeMin=cache&&cache.ts?Math.round((Date.now()-cache.ts)/60000):Infinity;
     if(cache&&cache.cur&&cacheAgeMin<60){
-      wxRender({current:cache.cur,daily:cache.daily,hourly:cache.hourly},cache.locName||locName,cache.aqData||null);
+      wxRender({current:cache.cur,daily:cache.daily,hourly:cache.hourly},cache.locName||locName,cache.aqData||null,false);
       locLabel.textContent='Showing: '+(cache.locName||locName)+'  ·  updating…';
     } else {
       wxOut.innerHTML='<div style="color:var(--muted);padding:16px;text-align:center;font-style:italic;">Loading weather...</div>';
@@ -32113,9 +32382,11 @@ body.sepia #view-weather{--muted:#4a3a26;}
     }catch(e){
       /* Try offline cache */
       if(S.weatherData&&S.weatherData.cur){
-        wxRender({current:S.weatherData.cur,daily:S.weatherData.daily,hourly:S.weatherData.hourly},S.weatherData.locName||locName,S.weatherData.aqData||null);
-        const age=Math.round((Date.now()-S.weatherData.ts)/60000);
-        locLabel.textContent='Offline — cached '+age+'min ago · '+( S.weatherData.locName||locName);
+        wxRender({current:S.weatherData.cur,daily:S.weatherData.daily,hourly:S.weatherData.hourly},S.weatherData.locName||locName,S.weatherData.aqData||null,false);
+        const ms=Date.now()-(S.weatherData.ts||Date.now());
+        const mins=Math.max(0,Math.round(ms/60000));
+        const agoTxt=mins<1?'just now':mins<60?(mins+'min ago'):mins<1440?(Math.round(mins/60)+'h ago'):(Math.round(mins/1440)+'d ago');
+        locLabel.textContent='Offline — cached '+agoTxt+' · '+(S.weatherData.locName||locName);
       } else {
         wxOut.innerHTML='<div style="color:var(--muted);padding:16px;text-align:center;">No internet and no cached data available.<br><small style="color:var(--muted)">'+e.message+'</small></div>';
       }
@@ -51139,6 +51410,9 @@ messages:()=>{
       try{
         _messages=await _groupFetchMessages(g.code);
         try{_khClearGroupUnread(g.code);}catch(_){}
+        /* Mark everything we just loaded as seen so the notifier won't re-toast
+           messages the user is reading right now. */
+        try{if(_messages&&_messages.length)_khMarkGroupSeen(g.code,_messages[_messages.length-1].id);}catch(_){}
         _loading=false;
         renderMessages(_messages);
         /* Update member count in header */
@@ -51273,6 +51547,9 @@ messages:()=>{
               const m={id:r.id,userId:r.user_id||'',displayName:r.display_name||'',text:decText,ts:r.ts,replyTo:r.reply_to||null,edited:!!r.edited,important:!!r.important,device:r.device_hint||'',location:r.location_hint||''};
               if(!_messages.find(x=>x.id===m.id)){
                 _messages.push(m);renderMessages(_messages);
+                /* The user is looking at this group — count it as seen so the
+                   background poller doesn't toast it again later. */
+                try{_khMarkGroupSeen(g.code,m.id);}catch(_){}
                 /* Push toast for incoming messages from other users.
                    Pass m.id as the dedup key so this realtime path
                    and the 45-second polling path share a single
@@ -53167,6 +53444,17 @@ window.CandyCrush=(()=>{
 
   function getLevelDef(lv){return LEVELS[Math.min(lv-1,LEVELS.length-1)];}
   function getGems(lv){return BASE_GEMS.slice(0,getLevelDef(lv).gemCount);}
+  /* Pick the colour a WILD should clear: the MOST COMMON colour actually on the
+     board (restricted to the level's active palette). Picking from all 6 base
+     gems — as the old code did — frequently chose a colour not in play on early
+     levels, so the WILD cleared nothing yet still consumed a move/explosion. */
+  function _wildTarget(){
+    const active=getGems(level).map(g=>g.id);
+    const counts={};
+    for(const rw of board)for(const x of rw){if(x&&active.indexOf(x.id)>=0)counts[x.id]=(counts[x.id]||0)+1;}
+    const ids=Object.keys(counts);
+    return ids.length?ids.reduce((a,b)=>counts[b]>counts[a]?b:a):active[0];
+  }
 
   function rndBaseGem(lv){
     const gems=getGems(lv);
@@ -53292,7 +53580,7 @@ window.CandyCrush=(()=>{
       } else if(sid==='WILD'){
         // Clear all of a random colour
         const gem=board[sr][sc]||BASE_GEMS[0];
-        const targetId=BASE_GEMS[Math.floor(Math.random()*BASE_GEMS.length)].id;
+        const targetId=_wildTarget();
         for(let r=0;r<ROWS;r++)for(let c=0;c<COLS;c++){if(board[r][c]&&board[r][c].id===targetId){board[r][c]=null;cleared++;}}
       }
     });
@@ -53456,7 +53744,7 @@ window.CandyCrush=(()=>{
     // Activate WILD by tapping it directly
     if(gem&&gem.id==='WILD'&&!selected){
       board[r][c]=null;
-      const targetId=BASE_GEMS[Math.floor(Math.random()*BASE_GEMS.length)].id;
+      const targetId=_wildTarget();
       let cleared=0;
       for(let rr=0;rr<ROWS;rr++)for(let cc=0;cc<COLS;cc++){if(board[rr][cc]&&board[rr][cc].id===targetId){board[rr][cc]=null;cleared++;}}
       moves--;
@@ -54080,6 +54368,12 @@ window._showWelcome=function(){
       /* Still set currentView so nav bookkeeping doesn't get confused */
       try{currentView='home';}catch(_){}
     }
+    /* If boot couldn't read the saved blob this time (transient inflate failure),
+       tell the user — we did NOT overwrite their data, so a reload usually
+       recovers the session; otherwise a re-login restores everything from cloud. */
+    if(window.__khStateLoadFailed){
+      setTimeout(function(){try{if(typeof toast==='function')toast('Couldn’t read your saved session this time — reload the page to recover it, or log in again. Your data is safe.',9000);}catch(_){}},800);
+    }
     setTimeout(()=>{S.totalSessions=(S.totalSessions||0)+1;save(2000);},50);
     /* Kick off the 45 s cloud-sync heartbeat if the user has a session.
        Idempotent — skipped if no auth, exits if already running. */
@@ -54697,6 +54991,18 @@ function renderKbd(){
 
   /* Bottom row */
   var rb=document.createElement('div');rb.className='kh-row';
+
+  /* "✕ off" — turn the floating keyboard OFF for good (persisted). Without this
+     the only dismiss was tap-away, which is session-only, so it reappeared on
+     every input focus and users had to dig into Settings repeatedly. */
+  var offBtn=mk('✕','kh-key-wide kh-key-muted',function(){
+    if(typeof S!=='undefined'){S.kindleKeyboardMode='off';delete S.kindleKeyboardManual;delete S.kindleKeyboard;try{if(typeof save==='function')save();}catch(_){}}
+    try{disable();}catch(_){}
+    if(typeof toast==='function')toast('Floating keyboard off. Turn it back on in Settings → Keyboard.',5000);
+  });
+  offBtn.title='Turn off the floating keyboard (re-enable in Settings → Keyboard)';
+  offBtn.style.minWidth='44px';
+  rb.appendChild(offBtn);
 
   var numBtn=mk(_numMode?'ABC':'123','kh-key-wide kh-key-muted',function(){_numMode=!_numMode;renderKbd();});
   numBtn.style.minWidth='52px';
