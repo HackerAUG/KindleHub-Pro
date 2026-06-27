@@ -3745,7 +3745,7 @@ function launchKindleDesktop(){
     /* Label */
     const lbl=document.createElement('div');
     lbl.className='kd-icon-lbl';
-    lbl.textContent=app.label;
+    lbl.textContent=_censorText(app.label);
     lbl.style.cssText='color:#111;font-size:10px;font-weight:600;text-align:center;margin-top:4px;max-width:70px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;letter-spacing:0.1px;line-height:1.2;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",sans-serif;';
     cell.appendChild(outer);cell.appendChild(lbl);
     /* Press feedback */
@@ -3898,7 +3898,7 @@ function launchKindleDesktop(){
     const sv=bx.querySelector('svg');if(sv){sv.style.cssText='width:32px;height:32px;position:relative;z-index:1;';}
     const lbl=document.createElement('div');lbl.className='dil';
     lbl.style.cssText='color:rgba(255,255,255,0.65);font-size:9px;font-weight:600;letter-spacing:0.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:62px;text-align:center;text-shadow:0 1px 4px rgba(0,0,0,0.6);transition:opacity .15s;';
-    lbl.textContent=app.label;
+    lbl.textContent=_censorText(app.label);
     const dot=document.createElement('div');dot.className='ddi';dot.style.cssText='width:4px;height:4px;border-radius:50%;background:#fff;opacity:0;margin-top:-2px;';
     item.appendChild(bx);item.appendChild(lbl);item.appendChild(dot);
     item.addEventListener('touchstart',()=>{bx.style.transform='scale(0.88)';},{passive:true});
@@ -4465,7 +4465,7 @@ function launchKindleDesktop(){
       ib.style.cssText='width:42px;height:42px;border-radius:12px;overflow:hidden;background:'+(app.color||'#374151')+';display:flex;align-items:center;justify-content:center;flex-shrink:0;';
       ib.innerHTML=app.icon||'';const sv=ib.querySelector('svg');if(sv){sv.style.width='28px';sv.style.height='28px';}
       const lbWrap=document.createElement('div');lbWrap.style.cssText='flex:1;min-width:0;';
-      const lb=document.createElement('div');lb.style.cssText='color:var(--fg,#111);font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';lb.textContent=app.label;
+      const lb=document.createElement('div');lb.style.cssText='color:var(--fg,#111);font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';lb.textContent=_censorText(app.label);
       if(app.builtWith){const bw=document.createElement('div');bw.style.cssText='color:var(--muted,#888);font-size:10px;margin-top:1px;';bw.textContent='Built with '+app.builtWith;lbWrap.appendChild(lb);lbWrap.appendChild(bw);}else{lbWrap.appendChild(lb);}
       const del=document.createElement('button');del.textContent='Remove';del.className='btn small';
       del.style.cssText+='color:#c0392b;border-color:#c0392b;';
@@ -6602,7 +6602,9 @@ function _badUsername(name){
    at boot + after any ban) so rendering stays fast. */
 function _dispName(name){
   if(typeof _khIsBannedSync==='function'&&_khIsBannedSync(name))return '[removed]';
-  return name;
+  /* Also profanity-censor every displayed name (chat authors, leaderboards,
+     about-modal, etc.) — this is the single choke point for name display. */
+  return typeof _censorText==='function'?_censorText(name):name;
 }
 window._censorText=_censorText;window._hasProfanity=_hasProfanity;window._badUsername=_badUsername;window._dispName=_dispName;
 
@@ -6998,7 +7000,7 @@ async function _renderAnnouncementWidget(card){
     visible.forEach(a=>{
       const block=el('div',{style:{display:'flex',gap:'8px',alignItems:'flex-start',borderTop:'1px dashed var(--muted)',paddingTop:'6px',marginTop:'6px'}});
       const body=el('div',{style:{flex:'1',minWidth:'0'}});
-      body.appendChild(txt('div',a.text,{style:{fontSize:'14px',lineHeight:'1.6',whiteSpace:'pre-wrap',wordBreak:'break-word'}}));
+      body.appendChild(txt('div',_censorText(a.text),{style:{fontSize:'14px',lineHeight:'1.6',whiteSpace:'pre-wrap',wordBreak:'break-word'}}));
       const metaBits=[new Date(a.created_at).toLocaleString()];
       if(Array.isArray(a.targets)&&a.targets.length){
         metaBits.push(isAdmin
@@ -13921,16 +13923,26 @@ window.KH_MP=(function(){
         };
       }catch(e){console.warn('KH_MP ws failed',e);}
     }
-    /* Polling fallback — only runs if the websocket isn't connected.
-       Skip the round-trip when WS is healthy (saves 1 request every 4 s
-       per active multiplayer session). Also skip when the tab is hidden. */
+    /* Polling fallback — runs whenever the websocket isn't connected, which is
+       ALWAYS on the Cloudflare D1 gateway (realtime is Supabase-only). Game
+       moves are turn-based, so a 2s poll feels responsive; a cheap newest-id
+       probe (~50 B) skips the full body fetch when nothing new arrived, so a
+       quiet room costs almost nothing. Paused while the tab is hidden. */
+    let _lastPollId=null;
     const poll=setInterval(async()=>{
       if(closed)return;
       if(wsOpen)return;
       if(typeof document!=='undefined'&&document.hidden)return;
       if(typeof _groupFetchMessages!=='function')return;
-      try{const msgs=await _groupFetchMessages(code);(msgs||[]).forEach(handle);}catch(e){}
-    },4000);
+      try{
+        if(typeof _groupLatestId==='function'){
+          const lid=await _groupLatestId(code);
+          if(lid&&lid===_lastPollId)return;   /* nothing new — skip the body fetch */
+          _lastPollId=lid;
+        }
+        const msgs=await _groupFetchMessages(code);(msgs||[]).forEach(handle);
+      }catch(e){}
+    },2000);
     return{close(){closed=true;if(ws){try{ws.close();}catch(e){}}if(hb)clearInterval(hb);clearInterval(poll);}};
   }
   /* ── Player search + invite system ────────────────────────────────────
@@ -26902,7 +26914,7 @@ home:()=>{
         const icon=el('div',{style:{display:'flex',flexDirection:'column',alignItems:'center',gap:'4px',cursor:'pointer',padding:'12px 4px 8px',borderRadius:'14px',border:isLast?'2px solid var(--fg)':'var(--thin)',background:isLast?'var(--highlight)':'var(--card)',boxShadow:'var(--shadow)',position:'relative',transition:'none'}});
         if(isLast){const dot=txt('div','▶',{style:{position:'absolute',top:'4px',right:'6px',fontSize:'8px',color:'var(--muted)'}});icon.appendChild(dot);}
         icon.appendChild(txt('div',app.icon,{style:{fontSize:'18px',fontWeight:'900',fontFamily:'monospace',lineHeight:'1',textAlign:'center',color:'var(--fg)',letterSpacing:'-1px'}}));
-        icon.appendChild(txt('div',app.label,{style:{fontSize:'9px',fontWeight:'700',textAlign:'center',color:'var(--muted)',lineHeight:'1.2',fontFamily:'var(--ui-font)',textTransform:'uppercase',letterSpacing:'0.3px',maxWidth:'56px',wordBreak:'break-word'}}));
+        icon.appendChild(txt('div',_censorText(app.label),{style:{fontSize:'9px',fontWeight:'700',textAlign:'center',color:'var(--muted)',lineHeight:'1.2',fontFamily:'var(--ui-font)',textTransform:'uppercase',letterSpacing:'0.3px',maxWidth:'56px',wordBreak:'break-word'}}));
         icon.onclick=()=>{
           /* Try nav tab first; fall back to direct showView */
           const t=document.querySelector('nav .tab[data-view="'+app.view+'"]');
@@ -33637,7 +33649,7 @@ breathe:()=>{
       const c=el('div',{style:{border:'var(--thin)',borderRadius:'6px',padding:'9px 10px',cursor:'pointer',userSelect:'none'}});
       c.id='gscard'+i;
       const nameRow=el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'baseline',gap:'4px',marginBottom:'2px'}});
-      nameRow.appendChild(txt('div',g.name,{style:{fontWeight:'800',fontSize:'12px'}}));
+      nameRow.appendChild(txt('div',_censorText(g.name),{style:{fontWeight:'800',fontSize:'12px'}}));
       nameRow.appendChild(txt('div',g.duration,{style:{fontSize:'10px',color:'var(--muted)',flexShrink:'0'}}));
       c.appendChild(nameRow);
       c.appendChild(txt('div',g.desc,{style:{fontSize:'10px',color:'var(--muted)',lineHeight:'1.4'}}));
@@ -45245,7 +45257,7 @@ mail:()=>{
         if(typeof _avatarEl==='function')line1.appendChild(_avatarEl(folder==='sent'?m.to:m.from,24));
         const whoCol=el('div',{style:{flex:'1',minWidth:'0'}});
         whoCol.appendChild(txt('div',_addrLbl(who),{style:{fontSize:'12px',fontWeight:unread?'900':'600',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
-        whoCol.appendChild(txt('div',m.subject||'(no subject)',{style:{fontSize:'12px',fontWeight:unread?'800':'400',color:unread?'var(--fg)':'var(--muted)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
+        whoCol.appendChild(txt('div',_censorText(m.subject||'(no subject)'),{style:{fontSize:'12px',fontWeight:unread?'800':'400',color:unread?'var(--fg)':'var(--muted)',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
         line1.appendChild(whoCol);
         line1.appendChild(txt('span',fmtTs(m.ts),{style:{fontSize:'10px',color:'var(--muted)',flexShrink:'0',alignSelf:'flex-start',marginTop:'2px'}}));
         row.appendChild(line1);
@@ -49982,7 +49994,7 @@ messages:()=>{
       row.appendChild(icon);
       const info=el('div',{style:{flex:'1',minWidth:'0'}});
       const titleRow=el('div',{style:{display:'flex',alignItems:'center',gap:'6px',flexWrap:'wrap'}});
-      titleRow.appendChild(txt('span',g.name||'Unnamed Group',{style:{fontWeight:'700',fontSize:'13px'}}));
+      titleRow.appendChild(txt('span',_censorText(g.name||'Unnamed Group'),{style:{fontWeight:'700',fontSize:'13px'}}));
       if(isGlobal){
         titleRow.appendChild(txt('span','PUBLIC',{style:{fontSize:'9px',fontWeight:'800',letterSpacing:'.5px',padding:'2px 7px',borderRadius:'10px',background:'var(--fg)',color:'var(--bg)'}}));
       }
@@ -50278,7 +50290,7 @@ messages:()=>{
     const hInfo=el('div',{style:{flex:'1',minWidth:'0',cursor:'pointer'}});
     const nameLine=el('div',{style:{display:'flex',alignItems:'center',gap:'4px'}});
     if(_sbActive())nameLine.appendChild(el('span',{className:'msg-realtime-dot',title:'Live updates'}));
-    nameLine.appendChild(txt('span',g.name,{style:{fontWeight:'800',fontSize:'14px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
+    nameLine.appendChild(txt('span',_censorText(g.name),{style:{fontWeight:'800',fontSize:'14px',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}));
     hInfo.appendChild(nameLine);
     const memberLine=txt('div','Tap for info',{style:{fontSize:'10px',color:'var(--muted)',fontFamily:'var(--ui-font)'}});
     hInfo.appendChild(memberLine);
@@ -50987,7 +50999,7 @@ messages:()=>{
     async function _openUserAboutModal(msg,grp){
       const ov=el('div',{style:{position:'fixed',top:'0',right:'0',bottom:'0',left:'0',background:'rgba(0,0,0,.6)',zIndex:'9999',display:'flex',alignItems:'center',justifyContent:'center',padding:'16px'}});
       const box=el('div',{style:{background:'var(--card)',borderRadius:'var(--radius)',padding:'18px',maxWidth:'480px',width:'100%',boxShadow:'var(--shadow-md)',maxHeight:'80vh',overflowY:'auto'}});
-      box.appendChild(txt('h3','User · '+(msg.displayName||'Unknown'),{style:{fontFamily:'var(--title-font)',fontSize:'16px',marginBottom:'4px'}}));
+      box.appendChild(txt('h3','User · '+_dispName(msg.displayName||'Unknown'),{style:{fontFamily:'var(--title-font)',fontSize:'16px',marginBottom:'4px'}}));
       box.appendChild(txt('div','Admin view — visible to admins only',{style:{fontSize:'10px',color:'var(--danger)',fontWeight:'800',letterSpacing:'.5px',textTransform:'uppercase',marginBottom:'10px'}}));
       const info=el('div',{style:{fontSize:'12px',lineHeight:'1.7',fontFamily:'var(--ui-font)'}});
       info.appendChild(txt('div','Loading profile…',{style:{color:'var(--muted)'}}));
@@ -51204,7 +51216,7 @@ messages:()=>{
         pinBox.appendChild(txt('div','PINNED ('+pins.length+')',{style:{fontSize:'10px',fontWeight:'800',color:'var(--muted)',letterSpacing:'.5px'}}));
         pins.slice(0,3).forEach(p=>{
           const r=el('div',{style:{fontSize:'12px',lineHeight:'1.4',cursor:'pointer'}});
-          r.innerHTML='<b>'+String(p.displayName||'?').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+':</b> '+String(_censorText(p.text||'')).slice(0,120).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+((p.text||'').length>120?'…':'');
+          r.innerHTML='<b>'+String(_dispName(p.displayName||'?')).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+':</b> '+String(_censorText(p.text||'')).slice(0,120).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+((p.text||'').length>120?'…':'');
           r.onclick=()=>{
             /* Scroll to the original message in the log */
             const target=log.querySelector('[data-msg-id="'+p.id+'"]');
@@ -51253,7 +51265,7 @@ messages:()=>{
         if(m.replyTo&&msgById[m.replyTo]){
           const rq=el('div',{className:'msg-reply-quote'});
           const orig=msgById[m.replyTo];
-          rq.innerHTML='<b>'+String(orig.displayName||'Unknown').replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+':</b> '+(_censorText(orig.text||'')).slice(0,80).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+((orig.text||'').length>80?'…':'');
+          rq.innerHTML='<b>'+String(_dispName(orig.displayName||'Unknown')).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+':</b> '+(_censorText(orig.text||'')).slice(0,80).replace(/[<>&]/g,c=>({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]))+((orig.text||'').length>80?'…':'');
           bubble.appendChild(rq);
         }
         if(m.important)bubble.appendChild(txt('span','IMPORTANT',{className:'msg-important-tag'}));
@@ -51729,7 +51741,7 @@ messages:()=>{
     const modal=el('div',{style:{background:'var(--card)',borderRadius:'var(--radius)',padding:'20px',maxWidth:'320px',width:'100%',display:'flex',flexDirection:'column',gap:'14px',boxShadow:'var(--shadow-md)'}});
 
     const mHdr=el('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center'}});
-    mHdr.appendChild(txt('strong',g.name,{style:{fontFamily:'var(--title-font)',fontSize:'15px'}}));
+    mHdr.appendChild(txt('strong',_censorText(g.name),{style:{fontFamily:'var(--title-font)',fontSize:'15px'}}));
     const cls=txt('button','x',{style:{background:'none',border:'none',fontSize:'18px',cursor:'pointer',color:'var(--muted)',padding:'0',lineHeight:'1'}});
     cls.onclick=()=>overlay.remove();
     mHdr.appendChild(cls);
