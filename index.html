@@ -1662,7 +1662,19 @@ async function _maybePullFromCloud(){
      paths (focus, visibility, online events) are safe to run regardless. */
   let packed=null,cloudAt='';
   try{
-    if(typeof _sbActive==='function'&&_sbActive()){
+    const _gw=_stateGatewayUrl();
+    if(_gw){
+      /* R2 gateway: cheap meta probe (HEAD) first, then the blob ONLY if it
+         changed — same egress discipline as the Supabase path, but the download
+         is on Cloudflare R2 where egress is free. */
+      const meta=await _r2GetState(_gw,S.authToken,true);
+      const upAt=(meta&&meta.updated_at)||'';
+      if(!upAt)return;/* nothing in R2 yet (account not migrated) — local state stays; pushed on next save */
+      if(upAt===_lastPulledAt)return;/* unchanged — skip the big download */
+      const full=await _r2GetState(_gw,S.authToken,false);
+      cloudAt=full.updated_at||'';
+      packed=full.state||null;
+    } else if(typeof _sbActive==='function'&&_sbActive()){
       /* EGRESS FIX: read the tiny updated_at FIRST and bail if it hasn't changed
          since our last pull — only THEN download the large encrypted state. This
          used to fetch state+updated_at together, re-downloading the full state on
@@ -6224,7 +6236,25 @@ const KH_REG='9a40d7cc-4373-40eb-8c09-33a2a0d50516';
 const JS_BASE='https://api.jsonstorage.net/v1/json/'+JS_COL+'/';
 
 /* ── Supabase REST helpers (PostgREST) ──────────────────────────────── */
+/* API gateway (Cloudflare D1 + Workers). When set, ALL REST/RPC traffic routes
+   here instead of Supabase — zero egress. Blank = Supabase, behaves as before.
+   The Worker (api-worker.js) speaks the same PostgREST subset, so only the base
+   URL changes. Realtime (chat websockets) is Supabase-only, so it's gated off
+   here and chat uses its existing 15s polling fallback.
+
+   ── FLEET ROLLOUT ──────────────────────────────────────────────────────────
+   localStorage is PER-DEVICE (great for the admin to test first). To switch
+   ALL users at once, paste your Worker URLs into the two KH_DEFAULT_* constants
+   below and redeploy index.min.html — every device then uses Cloudflare on next
+   load. A per-device localStorage value still overrides the default; set it to
+   the literal 'off' to force that one device back onto Supabase. Empty both =
+   Supabase, exactly as today. */
+const KH_DEFAULT_STATE_GATEWAY='';   /* e.g. 'https://kindlehub-state.you.workers.dev' */
+const KH_DEFAULT_API_GATEWAY='';     /* e.g. 'https://kindlehub-api.you.workers.dev'   */
+function _apiGatewayUrl(){try{const v=(localStorage.getItem('kh_api_gateway')||'').trim();if(v==='off')return '';return (v||KH_DEFAULT_API_GATEWAY).replace(/\/+$/,'');}catch(_){return (KH_DEFAULT_API_GATEWAY||'').replace(/\/+$/,'');}}
+function _sbBase(){const gw=_apiGatewayUrl();return gw||(SUPABASE_URL||'').replace(/\/$/,'');}
 function _sbActive(){
+  if(_apiGatewayUrl())return true;
   return SUPABASE_URL&&SUPABASE_URL.indexOf('supabase.co')>0
        &&SUPABASE_ANON_KEY&&SUPABASE_ANON_KEY.length>20
        &&SUPABASE_URL.indexOf('YOUR_')<0;
@@ -6240,7 +6270,7 @@ function _sbHeaders(extra){
 }
 async function _sbFetch(path,opts){
   opts=opts||{};
-  const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1'+path;
+  const url=_sbBase()+'/rest/v1'+path;
   const ac=typeof AbortController!=='undefined'?new AbortController():null;
   const tid=setTimeout(()=>{if(ac)ac.abort();},12000);
   let r;
@@ -6340,7 +6370,7 @@ async function _sbDelete(table,query,secret){
    PostgREST returns it in the Content-Range header when Prefer:count=exact
    is sent. Bypasses _sbFetch so we can read the header. */
 async function _sbCount(table,query){
-  const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/'+table+(query?'?'+query:'?select=*');
+  const url=_sbBase()+'/rest/v1/'+table+(query?'?'+query:'?select=*');
   const ac=typeof AbortController!=='undefined'?new AbortController():null;
   const tid=setTimeout(()=>{if(ac)ac.abort();},10000);
   try{
@@ -6670,7 +6700,7 @@ function _sbFriendlyErr(t,status){
 }
 async function _announceRpc(fn,body){
   try{
-    const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/rpc/'+fn;
+    const url=_sbBase()+'/rest/v1/rpc/'+fn;
     const r=await fetch(url,{method:'POST',headers:Object.assign(_sbHeaders(),{'Content-Type':'application/json','Prefer':'return=minimal'}),body:JSON.stringify(body||{})});
     if(r.ok||r.status===204)return true;
     let t='';try{t=await r.text();}catch(_){}
@@ -6679,6 +6709,95 @@ async function _announceRpc(fn,body){
     else toast('Couldn\'t post — '+_sbFriendlyErr(t,r.status),6500);
     return false;
   }catch(e){toast('Network error posting announcement.',4000);return false;}
+}
+/* ── Capacity Guard (emergency lockdown) ──────────────────────────────
+   Lets the admin CLOSE new sign-ins/registrations when the project is near
+   its hosting quota, with a user-facing "back on <date>" message — so the
+   project throttles ITSELF (during the quota grace period) instead of getting
+   suspended and stuck. Stored as a reserved broadcast announcement
+   ([[KH_CAP]] + JSON): ANON-readable, no schema change, written via the same
+   admin-token RPC as announcements. Auto-expires on the date (re-opens
+   itself). Admins — and anyone already signed in — are NEVER blocked. */
+const _CAP_TAG='[[KH_CAP]]';
+let _capState=null; /* {locked,until,message,at} | null = unknown */
+function _capCached(){
+  if(_capState)return _capState;
+  try{const r=JSON.parse(localStorage.getItem('kh_cap')||'null');if(r&&typeof r==='object')_capState=r;}catch(_){}
+  return _capState;
+}
+function _capEffective(){
+  /* Apply auto-expiry: a lockdown past its 'until' date counts as OPEN. */
+  const c=_capCached();
+  if(!c||!c.locked)return{blocked:false};
+  if(c.until){const t=Date.parse(c.until);if(!isNaN(t)&&(typeof NOW==='function'?NOW():Date.now())>=t)return{blocked:false,expired:true};}
+  return{blocked:true,until:c.until||'',message:c.message||''};
+}
+function _capStore(obj){
+  _capState=Object.assign({at:(typeof NOW==='function'?NOW():Date.now())},obj||{});
+  try{localStorage.setItem('kh_cap',JSON.stringify(_capState));}catch(_){}
+}
+async function _refreshCapacity(){
+  /* One tiny ANON read of the newest capacity control record. Cheap (a few
+     small rows) and safe pre-login. Keeps the last cache on any error. */
+  if(typeof _sbActive!=='function'||!_sbActive())return _capEffective();
+  try{
+    const rows=await _sbSelect('kh_announcements','select=text,created_at&active=eq.true&order=created_at.desc&limit=25');
+    let rec=null;
+    if(Array.isArray(rows))for(const r of rows){const tx=String(r.text||'');if(tx.indexOf(_CAP_TAG)===0){rec=tx.slice(_CAP_TAG.length);break;}}
+    if(rec===null)_capStore({locked:false});
+    else{let p={};try{p=JSON.parse(rec)||{};}catch(_){p={};}_capStore({locked:p.locked!==false,until:p.until||'',message:p.message||''});}
+  }catch(_){}
+  return _capEffective();
+}
+async function _isAdminUsername(name){
+  /* Mirror _checkAdmin's token-hash test on a login-attempt username, so the
+     admin can always sign in even while the gate is closed. */
+  try{
+    const tokens=String(name||'').toLowerCase().split(/[^a-z0-9]+/).filter(t=>t.length>=5&&t.length<=40);
+    for(const t of tokens){const h=await _sha256(t);if(_ADMIN_HASHES.indexOf(h)>=0)return true;}
+  }catch(_){}
+  return false;
+}
+function _capDateStr(until){
+  if(!until)return 'a later date';
+  try{const d=new Date(until);if(!isNaN(d.getTime()))return d.toLocaleDateString(undefined,{day:'numeric',month:'long',year:'numeric'});}catch(_){}
+  return String(until);
+}
+function _capMessage(){
+  const e=_capEffective();
+  const base='New sign-ins are paused while KindleHub is over its hosting capacity. Service resumes on '+_capDateStr(e.until)+'. Your account and saved data are safe — please check back then.';
+  return e.message?(base+'\n\n'+e.message):base;
+}
+/* Admin: post / lift the lockdown via the admin-token RPC (newest record wins). */
+async function _capSet(locked,until,message){
+  const payload=JSON.stringify({locked:!!locked,until:until||'',message:message||''});
+  const ok=await _announceRpc('kh_post_announcement',{p_text:_CAP_TAG+payload,p_token:window._adminToken||'',p_targets:[]});
+  if(ok)_capStore({locked:!!locked,until:until||'',message:message||''});
+  return ok;
+}
+/* A clear "sign-in paused / back on <date>" notice. Guests get Sign in (staff)
+   + Try again; already-signed-in users get a dismissible heads-up. */
+function _showCapacityNotice(){
+  if(document.getElementById('kh-cap-notice'))return;
+  const e=_capEffective();if(!e.blocked)return;
+  const signedIn=!!(typeof S!=='undefined'&&S.authToken);
+  const ov=el('div',{id:'kh-cap-notice',style:{position:'fixed',left:'0',right:'0',top:'0',zIndex:'400000',display:'flex',justifyContent:'center',padding:'10px',pointerEvents:'none'}});
+  const box=el('div',{style:{pointerEvents:'auto',maxWidth:'520px',width:'100%',background:'var(--card)',color:'var(--fg)',border:'2px solid var(--danger)',borderRadius:'12px',padding:'14px 16px',boxShadow:'var(--shadow-md)'}});
+  box.appendChild(txt('div',signedIn?'Heads up — sign-ins are paused':'Sign-in is paused',{style:{fontWeight:'800',fontSize:'15px',marginBottom:'6px',color:'var(--danger)'}}));
+  const msg=signedIn
+    ?('New sign-ins are paused while KindleHub is over its hosting capacity, until '+_capDateStr(e.until)+'. You\'re already signed in, so you\'re unaffected — keep using the app as normal.'+(e.message?('\n\n'+e.message):''))
+    :_capMessage();
+  box.appendChild(txt('div',msg,{style:{fontSize:'13px',lineHeight:'1.6',whiteSpace:'pre-wrap'}}));
+  const row=el('div',{style:{display:'flex',gap:'6px',marginTop:'10px',flexWrap:'wrap'}});
+  if(!signedIn){
+    const staff=txt('button','Sign in',{className:'btn small primary'});staff.onclick=()=>{ov.remove();try{showView('settings');}catch(_){}};
+    const retry=txt('button','Try again',{className:'btn small'});retry.onclick=()=>{try{location.reload();}catch(_){}};
+    row.append(staff,retry);
+  }
+  const dismiss=txt('button',signedIn?'Got it':'Browse offline',{className:'btn small'});
+  dismiss.onclick=()=>ov.remove();row.appendChild(dismiss);
+  box.appendChild(row);ov.appendChild(box);
+  (document.body||document.documentElement).appendChild(ov);
 }
 /* ── Username ban list ────────────────────────────────────────────────
    Approving a username report bans the NAME (you can't rename an account —
@@ -6714,7 +6833,7 @@ async function _khIsBanned(name){
    parsed text so callers can surface specific errors). */
 async function _adminRpc(fn,body){
   try{
-    const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/rpc/'+fn;
+    const url=_sbBase()+'/rest/v1/rpc/'+fn;
     const r=await fetch(url,{method:'POST',headers:Object.assign(_sbHeaders(),{'Content-Type':'application/json','Prefer':'return=minimal'}),body:JSON.stringify(body||{})});
     if(r.ok||r.status===204)return{ok:true};
     let t='';try{t=await r.text();}catch(_){}
@@ -6830,6 +6949,9 @@ async function _renderAnnouncementWidget(card){
   let anns=[],isAdmin=false;
   try{isAdmin=await _checkAdmin();}catch(_){}
   try{anns=isAdmin?await _loadAllAnnouncements():await _loadRelevantAnnouncements();}catch(_){}
+  /* Hide reserved Capacity-Guard control records — they're not real
+     announcements; the admin manages them from the Capacity guard card. */
+  try{anns=(anns||[]).filter(a=>String(a.text||'').indexOf(_CAP_TAG)!==0);}catch(_){}
   let dismissed=[];try{const d=JSON.parse(localStorage.getItem('kh_ann_dismissed')||'[]');if(Array.isArray(d))dismissed=d;}catch(_){}
   /* Non-admins only see announcements they haven't dismissed; admins see
      everything (so they can manage them). */
@@ -8606,6 +8728,27 @@ function _refreshStorageUI(){
    Fallback: legacy jsonstorage master doc (doc.users[hash]) used when
    Supabase isn't configured AND for one-time migration of pre-existing
    accounts. State is dictionary-compressed → AES-GCM encrypted → base64. */
+/* ── Cloudflare R2 state gateway (free-egress state storage) ─────────────────
+   OPT-IN via Admin → Local Insights → "State gateway (Cloudflare R2)". When the
+   URL is set, the big encrypted state blob is read/written from R2 (which has
+   ZERO egress fees) instead of Supabase; a tiny registry row (hash+email, state
+   cleared) is still kept in Supabase so username-uniqueness keeps working. When
+   the URL is BLANK, every branch below is skipped and sync behaves exactly as
+   before — so this is safe to ship and migrate to whenever you're ready. The
+   Worker + full setup live in state-worker.js. */
+function _stateGatewayUrl(){try{const v=(localStorage.getItem('kh_state_gateway')||'').trim();if(v==='off')return '';return (v||KH_DEFAULT_STATE_GATEWAY).replace(/\/+$/,'');}catch(_){return (KH_DEFAULT_STATE_GATEWAY||'').replace(/\/+$/,'');}}
+async function _r2PutState(gw,hash,email,packed){
+  const r=await fetch(gw+'/state',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({hash:hash,email:email||'',state:packed||''})});
+  if(!r.ok)throw new Error('state gateway PUT '+r.status);
+  const d=await r.json().catch(function(){return {};});
+  return (d&&d.updated_at)||'';
+}
+async function _r2GetState(gw,hash,metaOnly){
+  const u=gw+'/state?hash='+encodeURIComponent(hash)+(metaOnly?'&meta=1':'');
+  const r=await fetch(u);
+  if(!r.ok)throw new Error('state gateway GET '+r.status);
+  return await r.json();/* {state,updated_at} (full) or {updated_at} (meta) */
+}
 async function _saveUser(key,email,stateObj){
   const encKey=S._encKey||key;
   const packed=await _encryptState(encKey,_trimStateForCloud(stateObj));
@@ -8613,18 +8756,37 @@ async function _saveUser(key,email,stateObj){
      account stays usable with no network. Runs on every save/sync, so the
      cached copy is always current. */
   try{_cacheOfflineCred(key,email,packed);}catch(_){}
+  const _ua=new Date().toISOString();
+  const _gw=_stateGatewayUrl();
+  if(_gw){
+    /* Big blob → R2 (free egress). Then keep a TINY Supabase registry row
+       (email kept, state cleared) so username-uniqueness still works — but only
+       AFTER R2 confirms the write, so a failed R2 push never clears the fallback.
+       Local state is always the backstop, so clearing the Supabase blob is safe. */
+    const r2ua=await _r2PutState(_gw,key,email,packed);
+    if(typeof _sbActive==='function'&&_sbActive()){try{await _sbUpsert('kh_users',{hash:key,email,state:null,updated_at:r2ua||_ua},'hash');}catch(_){}}
+    return r2ua||_ua;
+  }
   if(_sbActive()){
     /* Upsert on hash; if email/state changed we update; otherwise insert */
-    await _sbUpsert('kh_users',{hash:key,email,state:packed,updated_at:new Date().toISOString()},'hash');
-    return;
+    await _sbUpsert('kh_users',{hash:key,email,state:packed,updated_at:_ua},'hash');
+    return _ua;
   }
   /* Legacy path */
   await _masterWrite(d=>{
-    d.users[key]={e:email,s:packed,u:new Date().toISOString()};
+    d.users[key]={e:email,s:packed,u:_ua};
   });
+  return _ua;
 }
 
 async function _loadUser(key){
+  const _gw=_stateGatewayUrl();
+  if(_gw){
+    /* R2 is the source of truth when the gateway is set. If it has nothing yet
+       (account not migrated) or is unreachable, fall through to Supabase so no
+       one loses access during the transition. */
+    try{const d=await _r2GetState(_gw,key,false);if(d&&d.state)return d.state;}catch(e){console.warn('R2 load failed',e);}
+  }
   if(_sbActive()){
     try{
       const rows=await _sbSelect('kh_users','hash=eq.'+encodeURIComponent(key)+'&select=state,email');
@@ -8864,6 +9026,9 @@ async function authRegister(email,password){
     try{ if(typeof _khIsBanned==='function'&&await _khIsBanned(email)){
       return{success:false,error:'That username isn\'t available — please choose another.'};
     } }catch(_){}
+    /* Capacity lockdown: new registrations are closed while over quota
+       (the admin is exempt so they can always get in to manage it). */
+    try{ await _refreshCapacity(); if(_capEffective().blocked && !(await _isAdminUsername(email))) return{success:false,error:_capMessage()}; }catch(_){}
     /* Enforce UNIQUE usernames: if this name is already taken (by anyone — even
        with a different password) append the next free number, "john"→"john2".
        Login is hash(username+password), so the FINAL name must be fixed before
@@ -8903,11 +9068,22 @@ async function authLogin(email,password){
     try{ if(typeof _khIsBanned==='function'&&await _khIsBanned(email)){
       return{success:false,error:'This account has been suspended for an inappropriate username.'};
     } }catch(_){}
+    /* Capacity lockdown: new sign-ins are paused while over quota. Admins are
+       exempt; anyone already signed in never reaches authLogin, so they're
+       unaffected. Checked BEFORE the egress-heavy state lookup below. */
+    try{ await _refreshCapacity(); if(_capEffective().blocked && !(await _isAdminUsername(email))) return{success:false,error:_capMessage()}; }catch(_){}
     const key=await _userKey(email,password);
     let packed=null;
     let needsMigration=false; /* true if found in legacy jsonstorage but not Supabase */
-    /* Try Supabase first */
-    if(_sbActive()){
+    /* State gateway (Cloudflare R2): when set, the encrypted blob lives in R2
+       and the kh_users registry row's state is null — so load it from R2 first,
+       or a fresh device (no offline cache) would read null and fail to sign in. */
+    try{
+      const _sgw=(typeof _stateGatewayUrl==='function')?_stateGatewayUrl():'';
+      if(_sgw){ const d=await _r2GetState(_sgw,key,false); if(d&&d.state)packed=d.state; }
+    }catch(e){console.warn('R2 login lookup failed',e);}
+    /* Try Supabase (or the D1 gateway) next */
+    if(!packed&&_sbActive()){
       try{
         const rows=await _sbSelect('kh_users','hash=eq.'+encodeURIComponent(key)+'&select=state');
         if(Array.isArray(rows)&&rows.length&&rows[0].state)packed=rows[0].state;
@@ -8992,7 +9168,12 @@ async function syncToCloud(){
   if(_syncInFlight){_syncQueued=true;return;}
   _syncInFlight=true;
   try{
-    await _saveUser(S.authToken,S.email,_buildSafeState());
+    const _ua=await _saveUser(S.authToken,S.email,_buildSafeState());
+    /* EGRESS: we just wrote this exact state, so mark it as already-pulled —
+       otherwise the next pull's updated_at probe sees "changed" and re-downloads
+       our OWN push (the blob can be 100KB–1MB), roughly doubling state egress for
+       active users. Other devices' newer writes still bump updated_at and pull. */
+    if(_ua)_lastPulledAt=_ua;
     S.lastSync=Date.now();
     _lastSyncedHash=_stateFingerprint();
     _stateDirty=false;
@@ -9541,7 +9722,7 @@ async function _groupToggleReaction(code,msgId,key){
      reloaded its schema cache to see it. */
   let rpcOk=false;
   try{
-    const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/rpc/kh_set_reaction';
+    const url=_sbBase()+'/rest/v1/rpc/kh_set_reaction';
     const r=await fetch(url,{
       method:'POST',
       headers:Object.assign(_sbHeaders(),{'Prefer':'return=minimal'}),
@@ -11715,6 +11896,7 @@ const GAME_HELP={
   candycrush:{name:'Match 3',how:'Swap adjacent pieces to line up three or more of a kind. Matches clear and score — set up chains for big combos.'},
   blockblast:{name:'Block Blast',how:'Drag the block shapes onto the grid. Fill a full row or column to clear it. It ends when no piece can fit.'},
   racer:{name:'Turbo Racer',how:'A 3D road RACE against 5 rivals over 2 laps. ▲ accelerates, ▼ brakes, ◄ ► steer (or arrow keys / swipe; tap top half = gas, bottom half = brake). Pass the red cars and cross the finish line first — finishing position is your result (1st wins, top 3 is a podium). Keep off the grass or you slow right down, and beat the clock or it\'s a DNF. Win bigger by finishing higher with time to spare.'},
+  geometrydash:{name:'Geometry Dash',how:'A one-button rhythm runner. Your cube auto-runs to the right — TAP the screen (or press Space / ▲) to jump. Clear the spikes, land on and ride the blocks, and reach 100% to beat the level "Stereo Madness". Crash into a spike or the side of a block and you restart from the beginning — tap to retry instantly. It\'s all about timing your jumps; learn the layout and beat your best percentage.'},
 };
 function _showGameHelp(g){
   const h=(typeof GAME_HELP!=='undefined'&&GAME_HELP[g])||null;
@@ -12774,6 +12956,7 @@ function _doLaunch(g){
     case 'sudoku':     Sudoku.start();break;
     case 'snake':      Snake.start();break;
     case 'slither':    Slither.start();break;
+    case 'geometrydash': GeometryDash.start();break;
     case 'g2048':      G2048.start();break;
     case 'tetris':     Tetris.start();break;
     case 'spaceinv':   _initSpaceInvaders();   SpaceInvaders.start();break;
@@ -13699,7 +13882,7 @@ window.KH_MP=(function(){
     }
     /* Realtime websocket — mirrors the messages BUILDER pattern */
     let wsOpen=false;
-    if(typeof SUPABASE_URL!=='undefined'&&typeof SUPABASE_ANON_KEY!=='undefined'){
+    if(typeof SUPABASE_URL!=='undefined'&&typeof SUPABASE_ANON_KEY!=='undefined'&&!(typeof _apiGatewayUrl==='function'&&_apiGatewayUrl())){
       try{
         const url=SUPABASE_URL.replace(/^https?:/,'wss:').replace(/\/$/,'')+'/realtime/v1/websocket?apikey='+encodeURIComponent(SUPABASE_ANON_KEY)+'&vsn=1.0.0';
         ws=new WebSocket(url);
@@ -16426,6 +16609,178 @@ const Snake=(()=>{
     if(!(d.x===-game.dir.x&&d.y===-game.dir.y))game.nextDir=d;e.preventDefault();
   });
   $('immersiveExit').addEventListener('click',()=>{if(timer){clearInterval(timer);timer=null;}});
+  function stop(){if(timer){clearInterval(timer);timer=null;}game=null;}
+  return{start,stop};
+})();
+
+/* ── Geometry Dash (Lite) — "Stereo Madness" rhythm runner ──────────────
+   A light, original take on Geometry Dash: an auto-running cube on a fixed,
+   hand-authored level. Tap / Space / ▲ to jump; clear the spikes, ride the
+   blocks, reach 100%. One learnable layout so it's beatable with practice
+   (instant retry, GD-style). Canvas + flat fills + a modest framerate, kept
+   e-ink friendly like Snake/Racer (no audio — Kindle speakers are unreliable;
+   the scrolling grid carries the "to the beat" feel). */
+const GeometryDash=(()=>{
+  const W=360,H=240,GY=196,SZ=18,HALF=9,PX=58;
+  const G=0.92,JV=-11.2,SPD=4.2,FR=38;
+  const SPK_W=22,SPK_H=18,BLK_W=26,BLK_H=22;
+  /* Fixed level: [type,x] where x = left edge in world px, ascending. Generous
+     gaps so every spike/cluster is clearable in a single forgiving jump. */
+  const LEVEL=[
+    ['spike',460],['spike',720],['spike',1000],['spike2',1300],
+    ['block',1640],['spike',1960],['spike',2230],['spike2',2520],
+    ['spike',2840],['block',3160],['spike',3480],['spike2',3780],
+    ['spike',4140],['block',4460],['spike',4790],['spike2',5080],
+    ['spike',5400]
+  ].map(o=>({t:o[0],x:o[1]}));
+  const LEVEL_LEN=5400+SPK_W+440; /* finish line a little past the last obstacle */
+  let game=null,timer=null,attempts=0,_submitted=false;
+
+  function _best(){return (S.games&&S.games.geometrydash&&S.games.geometrydash.best)||0;}
+
+  function start(){
+    if(timer){clearInterval(timer);timer=null;}
+    _submitted=false;attempts++;
+    game={camX:0,y:GY-HALF,vy:0,onGround:true,rot:0,active:true,dead:false,won:false,reached:0};
+    enterImmersive('Geometry Dash','0%');
+    immersiveRoot._trackStop=stop;
+    buildUI();
+    if(timer)clearInterval(timer);
+    timer=setInterval(tick,FR);
+    draw();
+  }
+
+  function buildUI(){
+    immersiveContent.innerHTML='';
+    const bar=txt('div','Stereo Madness — 0%  ·  Attempt '+attempts+'  ·  Best '+_best()+'%',{id:'gdBar',style:{textAlign:'center',fontSize:'12px',fontWeight:'700',margin:'2px 0 4px',color:'var(--fg)'}});
+    immersiveContent.appendChild(bar);
+    const canvas=el('canvas',{id:'gdCanvas',width:W,height:H});
+    canvas.style.cssText='display:block;margin:4px auto;max-width:100%;border:2px solid var(--fg);touch-action:none;';
+    immersiveContent.appendChild(canvas);
+    const tap=e=>{e.preventDefault();onTap();};
+    canvas.addEventListener('touchstart',tap,{passive:false});
+    canvas.addEventListener('mousedown',tap);
+    immersiveContent.appendChild(txt('div','Tap the screen (or Space / ▲) to jump. Crash = restart — tap to retry.',{style:{textAlign:'center',fontSize:'11px',color:'var(--muted)',marginTop:'2px'}}));
+    const ctrl=el('div',{className:'card-row',style:{marginTop:'6px',justifyContent:'center'}});
+    const jb=txt('button','Jump',{className:'btn primary',style:{minWidth:'130px',fontSize:'16px'}});
+    jb.ontouchstart=jb.onclick=(e)=>{e.preventDefault();onTap();};
+    ctrl.appendChild(jb);
+    ctrl.appendChild(Object.assign(txt('button','Restart',{className:'btn small'}),{onclick:()=>start()}));
+    immersiveContent.appendChild(ctrl);
+  }
+
+  function onTap(){
+    if(!game)return;
+    if(game.dead||game.won){start();return;}/* tap to retry / replay */
+    jump();
+  }
+  function jump(){if(game&&game.active&&game.onGround){game.vy=JV;game.onGround=false;}}
+  function overlap(aL,aR,bL,bR){return aL<bR&&aR>bL;}
+
+  function tick(){
+    if(!game||!game.active)return;
+    game.camX+=SPD;
+    game.vy+=G;game.y+=game.vy;
+    if(!game.onGround)game.rot+=0.22;
+    const cx=game.camX+PX,pL=cx-HALF+3,pR=cx+HALF-3;
+    /* support: ground, or the top of a block we're descending onto */
+    let floor=GY;
+    for(let i=0;i<LEVEL.length;i++){const o=LEVEL[i];if(o.t!=='block')continue;
+      const top=GY-BLK_H;
+      if(overlap(pL,pR,o.x,o.x+BLK_W)&&game.vy>=0&&(game.y+HALF)<=top+SPD+4)floor=Math.min(floor,top);
+    }
+    if((game.y+HALF)>=floor&&game.vy>=0){game.y=floor-HALF;game.vy=0;game.onGround=true;game.rot=0;}
+    else game.onGround=false;
+    /* deaths: block side-faces and any spike you didn't clear */
+    const pBottom=game.y+HALF;
+    for(let i=0;i<LEVEL.length;i++){const o=LEVEL[i];
+      if(o.t==='block'){
+        if(overlap(pL,pR,o.x,o.x+BLK_W)&&pBottom>(GY-BLK_H)+8)return die();
+      }else{
+        const n=o.t==='spike3'?3:o.t==='spike2'?2:1,w=SPK_W*n;
+        if(overlap(pL,pR,o.x+4,o.x+w-4)&&pBottom>(GY-SPK_H)+2)return die();
+      }
+    }
+    game.reached=Math.max(game.reached,Math.min(100,Math.round(game.camX/LEVEL_LEN*100)));
+    const sb=$('gdBar');if(sb){const v='Stereo Madness — '+game.reached+'%  ·  Attempt '+attempts+'  ·  Best '+Math.max(_best(),game.reached)+'%';if(sb.textContent!==v)sb.textContent=v;}
+    updateImmersiveScore(game.reached+'%');
+    if(game.camX>=LEVEL_LEN)return win();
+    draw();
+  }
+
+  function die(){
+    if(!game||!game.active)return;
+    game.active=false;game.dead=true;
+    if(timer){clearInterval(timer);timer=null;}
+    saveBest(game.reached,false);draw();
+    toast('Crashed at '+game.reached+'% — tap to retry');
+  }
+  function win(){
+    if(!game||!game.active)return;
+    game.active=false;game.won=true;game.reached=100;
+    if(timer){clearInterval(timer);timer=null;}
+    saveBest(100,true);draw();
+    toast('You beat Stereo Madness! 100%');
+  }
+  function saveBest(pct,won){
+    if(!S.games.geometrydash)S.games.geometrydash={best:0};
+    S.games.geometrydash.best=Math.max(S.games.geometrydash.best||0,pct);
+    saveNow();
+    if(!_submitted){_submitted=true;try{_khSubmitScore('geometrydash',pct);}catch(_){}}
+    recordStat('geometrydash',!!won);
+  }
+
+  function draw(){
+    const c=$('gdCanvas');if(!c)return;const ctx=c.getContext('2d');
+    const dark=document.body.classList.contains('dark');
+    const ink=dark?'#eee':'#161616',paper=dark?'#111':'#f6f6f6',faint=dark?'#333':'#dcdcdc',ground=dark?'#1a1a1a':'#e9e9e9';
+    ctx.fillStyle=paper;ctx.fillRect(0,0,W,H);
+    /* scrolling grid — GD look + a sense of motion/beat */
+    ctx.strokeStyle=faint;ctx.lineWidth=1;ctx.beginPath();
+    const off=game?(game.camX%80):0;
+    for(let gx=-off;gx<=W;gx+=80){ctx.moveTo(gx,0);ctx.lineTo(gx,GY);}
+    ctx.moveTo(0,GY-44);ctx.lineTo(W,GY-44);ctx.moveTo(0,GY-88);ctx.lineTo(W,GY-88);
+    ctx.stroke();
+    /* ground */
+    ctx.fillStyle=ground;ctx.fillRect(0,GY,W,H-GY);
+    ctx.strokeStyle=ink;ctx.lineWidth=2;ctx.beginPath();ctx.moveTo(0,GY);ctx.lineTo(W,GY);ctx.stroke();
+    /* obstacles */
+    ctx.fillStyle=ink;
+    if(game)for(let i=0;i<LEVEL.length;i++){const o=LEVEL[i],sx=o.x-game.camX;
+      if(sx>W+40||sx<-90)continue;
+      if(o.t==='block'){
+        ctx.fillStyle=ink;ctx.fillRect(sx,GY-BLK_H,BLK_W,BLK_H);
+        ctx.strokeStyle=paper;ctx.lineWidth=1;ctx.strokeRect(sx+3,GY-BLK_H+3,BLK_W-6,BLK_H-6);
+      }else{
+        const n=o.t==='spike3'?3:o.t==='spike2'?2:1;
+        ctx.fillStyle=ink;
+        for(let k=0;k<n;k++){const bx=sx+k*SPK_W;
+          ctx.beginPath();ctx.moveTo(bx,GY);ctx.lineTo(bx+SPK_W/2,GY-SPK_H);ctx.lineTo(bx+SPK_W,GY);ctx.closePath();ctx.fill();}
+      }
+    }
+    /* player cube — rotates while airborne */
+    if(game){
+      ctx.save();ctx.translate(PX,game.y);ctx.rotate(game.rot);
+      ctx.fillStyle=ink;ctx.fillRect(-HALF,-HALF,SZ,SZ);
+      ctx.fillStyle=paper;ctx.fillRect(-HALF+4,-HALF+4,SZ-8,SZ-8);
+      ctx.restore();
+    }
+    /* progress bar */
+    ctx.fillStyle=faint;ctx.fillRect(8,8,W-16,6);
+    ctx.fillStyle=ink;ctx.fillRect(8,8,game?Math.round((W-16)*Math.min(1,game.camX/LEVEL_LEN)):0,6);
+    /* banner */
+    if(game&&(game.dead||game.won)){
+      ctx.fillStyle=dark?'rgba(0,0,0,.55)':'rgba(255,255,255,.72)';ctx.fillRect(0,GY/2-26,W,52);
+      ctx.fillStyle=ink;ctx.textAlign='center';ctx.font='bold 18px sans-serif';
+      ctx.fillText(game.won?'LEVEL COMPLETE — 100%':('CRASHED — '+game.reached+'%'),W/2,GY/2-2);
+      ctx.font='12px sans-serif';ctx.fillText('Tap to '+(game.won?'play again':'retry'),W/2,GY/2+16);
+    }
+  }
+
+  document.addEventListener('keydown',e=>{
+    if(immersiveRoot.style.display!=='block'||!game)return;
+    if(e.key===' '||e.key==='ArrowUp'||e.key==='Up'){onTap();e.preventDefault();}
+  });
   function stop(){if(timer){clearInterval(timer);timer=null;}game=null;}
   return{start,stop};
 })();
@@ -23114,6 +23469,7 @@ const GAME_MAP=[
   {keys:['snakes and ladders','snakes ladders','snakes n ladders'],g:'snakesladders'},
   {keys:['word search','wordsearch'],g:'wordsearch'},
   {keys:['tower defence','tower defense','towerdef'],g:'towerdef'},
+  {keys:['geometry dash','geometrydash','geo dash','stereo madness','cube jump','rhythm runner'],g:'geometrydash'},
 ];
 function doConvert(n,from,to){
   const c={
@@ -27492,6 +27848,11 @@ games:()=>{
     c.appendChild(txt('p','Grow by eating dots, dodge other snakes — slither.io style.',{style:{fontSize:'11px',color:'var(--muted)',marginBottom:'4px'}}));
     c.appendChild(txt('p','Best: '+(S.games&&S.games.slither&&S.games.slither.best||0),{style:{fontSize:'11px',color:'var(--muted)'}}));
     c.appendChild(txt('button','Play',{className:'btn primary','data-game':'slither',style:{marginTop:'6px',width:'100%'}}));
+  }));
+  rowArc.appendChild(gc('Geometry Dash',null,c=>{
+    c.appendChild(txt('p','One-button rhythm runner. Tap to jump the spikes, ride the blocks, reach 100% on "Stereo Madness".',{style:{fontSize:'11px',color:'var(--muted)',marginBottom:'4px'}}));
+    c.appendChild(txt('p','Best: '+(S.games&&S.games.geometrydash&&S.games.geometrydash.best||0)+'%',{style:{fontSize:'11px',color:'var(--muted)'}}));
+    c.appendChild(txt('button','Play',{className:'btn primary','data-game':'geometrydash',style:{marginTop:'6px',width:'100%'}}));
   }));
   rowArc.appendChild(gc('Tetris',null,c=>{
     c.appendChild(txt('p','Stack falling pieces. Clear lines to score.',{style:{fontSize:'11px',color:'var(--muted)',marginBottom:'4px'}}));
@@ -34751,6 +35112,22 @@ settings:()=>{
     _syncNowBtn.onclick=async()=>{
       if(!navigator.onLine)return toast('Sync requires internet.');
       _syncNowBtn.disabled=true;_syncNowBtn.textContent='Pulling…';
+      /* When the R2 state gateway is on, the Supabase-specific inline diagnostics
+         below don't apply. Route through the standard R2-aware pull+push so a
+         manual sync can never clobber another device's R2 state. */
+      if(typeof _stateGatewayUrl==='function'&&_stateGatewayUrl()){
+        try{
+          const _be=Array.isArray(S.calEvents)?S.calEvents.length:0;
+          try{window._khLastPullAt=0;}catch(_){}
+          await _maybePullFromCloud();
+          _syncNowBtn.textContent='Pushing…';
+          await syncToCloud();
+          const _ae=Array.isArray(S.calEvents)?S.calEvents.length:0;
+          toast('Synced to R2 ✓'+(_ae!==_be?(' · now '+_ae+' events'):''),3500);
+        }catch(e){toast('Sync failed: '+String((e&&e.message)||e).slice(0,80),5000);}
+        _syncNowBtn.disabled=false;_syncNowBtn.textContent='Sync Now ⟳';
+        return;
+      }
       /* Diagnostic: capture before/after counts so the toast can tell
          the user EXACTLY what happened — was the pull empty? did
          decryption fail? did the merge run? Previously the button
@@ -34814,11 +35191,13 @@ settings:()=>{
           if(S.authToken&&S.syncEnabled){
             const packed=await _encryptState(S._encKey||S.authToken,_trimStateForCloud(_buildSafeState()));
             pushSize=packed?packed.length:0;
+            const _muaPush=new Date().toISOString();
             if(typeof _sbActive==='function'&&_sbActive()){
-              await _sbUpsert('kh_users',{hash:S.authToken,email:S.email,state:packed,updated_at:new Date().toISOString()},'hash');
+              await _sbUpsert('kh_users',{hash:S.authToken,email:S.email,state:packed,updated_at:_muaPush},'hash');
             } else {
-              await _masterWrite(d=>{d.users[S.authToken]={e:S.email,s:packed,u:new Date().toISOString()};});
+              await _masterWrite(d=>{d.users[S.authToken]={e:S.email,s:packed,u:_muaPush};});
             }
+            try{_lastPulledAt=_muaPush;}catch(_){}/* EGRESS: we just wrote this — don't let the periodic pull re-download our own push */
             S.lastSync=Date.now();
             _lastSyncedHash=_stateFingerprint();
             _stateDirty=false;
@@ -35725,7 +36104,7 @@ feedback:()=>{
         c.appendChild(sbStatus);
         async function _countRows(table,filter){
           try{
-            const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/'+table+(filter?'?'+filter:'');
+            const url=_sbBase()+'/rest/v1/'+table+(filter?'?'+filter:'');
             const r=await fetch(url,{method:'HEAD',headers:Object.assign(_sbHeaders(),{'Prefer':'count=exact','Range':'0-0'})});
             const cr=r.headers.get('content-range')||'';
             const m=cr.match(/\/(\d+)$/);
@@ -35733,7 +36112,7 @@ feedback:()=>{
           }catch(_){return null;}
         }
         async function _deleteRows(table,filter){
-          const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/'+table+'?'+filter;
+          const url=_sbBase()+'/rest/v1/'+table+'?'+filter;
           const r=await fetch(url,{method:'DELETE',headers:Object.assign(_sbHeaders(),{'Prefer':'return=minimal'})});
           if(!r.ok&&r.status!==204)throw new Error('HTTP '+r.status+' — '+(await r.text().catch(()=>'')).slice(0,160));
         }
@@ -36405,7 +36784,7 @@ feedback:()=>{
       }
       async function _tryRpc(name,body){
         try{
-          const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/rpc/'+name;
+          const url=_sbBase()+'/rest/v1/rpc/'+name;
           const r=await fetch(url,{method:'POST',headers:Object.assign(_sbHeaders(),{'Prefer':'return=minimal'}),body:JSON.stringify(body||{})});
           const tx=await r.text().catch(()=>'');
           if(r.status===404&&tx.indexOf('PGRST202')>=0)return 'PGRST202';
@@ -36415,7 +36794,7 @@ feedback:()=>{
       }
       async function _count(table,filter){
         try{
-          const url=SUPABASE_URL.replace(/\/$/,'')+'/rest/v1/'+table+(filter?'?'+filter:'');
+          const url=_sbBase()+'/rest/v1/'+table+(filter?'?'+filter:'');
           const r=await fetch(url,{method:'HEAD',headers:Object.assign(_sbHeaders(),{'Prefer':'count=exact','Range':'0-0'})});
           const cr=r.headers.get('content-range')||'';
           const m=cr.match(/\/(\d+)$/);return m?parseInt(m[1],10):null;
@@ -37004,6 +37383,49 @@ Deno.serve(async (req)=>{
       gwSave.onclick=()=>{try{const v=gwIn.value.trim();if(v)localStorage.setItem('kh_mail_gateway',v);else localStorage.removeItem('kh_mail_gateway');toast(v?'Gateway saved — external email is ON for this device.':'Gateway cleared.');}catch(_){}};
       gwRow.append(gwIn,gwSave);c.appendChild(gwRow);
       c.appendChild(txt('div','Deploy email-worker.js (in the repo) to Cloudflare, then paste its URL. Inbound mail needs no URL — it flows via Email Routing once the worker is live.',{style:{fontSize:'10px',color:'var(--muted)',marginTop:'4px',lineHeight:'1.5'}}));
+      /* State gateway — paste the deployed state-worker.js (Cloudflare R2) URL to
+         move the big per-user state blob off Supabase. R2 has ZERO egress fees, so
+         this is the permanent fix for the egress quota. Blank = stay on Supabase. */
+      c.appendChild(txt('div','State gateway (Cloudflare R2 — free egress)',{style:{fontSize:'11px',fontWeight:'800',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.5px',margin:'12px 0 4px'}}));
+      const sgRow=el('div',{style:{display:'flex',gap:'5px'}});
+      const sgIn=el('input',{type:'text',placeholder:'https://kindlehub-state.workers.dev',value:(localStorage.getItem('kh_state_gateway')||''),style:{flex:'1',fontSize:'11px',fontFamily:'monospace'}});
+      const sgSave=txt('button','Save',{className:'btn small'});
+      sgSave.onclick=()=>{try{const v=sgIn.value.trim().replace(/\/+$/,'');if(v)localStorage.setItem('kh_state_gateway',v);else localStorage.removeItem('kh_state_gateway');toast(v?'State gateway saved — cloud sync now uses R2 (free egress). Tap Sync Now to migrate this account.':'State gateway cleared — sync falls back to Supabase.',4500);}catch(_){}};
+      sgRow.append(sgIn,sgSave);c.appendChild(sgRow);
+      c.appendChild(txt('div','Deploy state-worker.js (in the repo) to Cloudflare + bind an R2 bucket, then paste its URL. Big state blobs move to R2 (no egress charge); chat/mail/scores stay on Supabase unless you also set the API gateway below. Leave blank to keep state on Supabase. Setup steps are in the worker file header.',{style:{fontSize:'10px',color:'var(--muted)',marginTop:'4px',lineHeight:'1.5'}}));
+      /* API gateway — paste the deployed api-worker.js (Cloudflare D1) URL to move
+         chat/mail/scores/announcements/presence/bans OFF Supabase too. Blank = Supabase. */
+      c.appendChild(txt('div','API gateway (Cloudflare D1 — free egress)',{style:{fontSize:'11px',fontWeight:'800',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.5px',margin:'12px 0 4px'}}));
+      const agRow=el('div',{style:{display:'flex',gap:'5px'}});
+      const agIn=el('input',{type:'text',placeholder:'https://kindlehub-api.workers.dev',value:(localStorage.getItem('kh_api_gateway')||''),style:{flex:'1',fontSize:'11px',fontFamily:'monospace'}});
+      const agSave=txt('button','Save',{className:'btn small'});
+      agSave.onclick=()=>{try{const v=agIn.value.trim().replace(/\/+$/,'');if(v)localStorage.setItem('kh_api_gateway',v);else localStorage.removeItem('kh_api_gateway');toast(v?'API gateway saved — chat/mail/scores now use Cloudflare D1 (free egress). Reload to apply everywhere.':'API gateway cleared — back to Supabase.',5000);}catch(_){}};
+      agRow.append(agIn,agSave);c.appendChild(agRow);
+      c.appendChild(txt('div','Deploy api-worker.js + schema-d1.sql to Cloudflare (one free D1 database), then paste the Worker URL. Moves chat, mail, scores, announcements, presence and the ban list off Supabase — zero egress. Blank = Supabase. Live chat falls back to ~15s polling on D1 (instant realtime is a later add-on). Reload after changing.',{style:{fontSize:'10px',color:'var(--muted)',marginTop:'4px',lineHeight:'1.5'}}));
+      /* ── Capacity guard ── close NEW sign-ins during a quota emergency, with
+         an auto-expiring "back on <date>" message, so the project throttles
+         itself instead of getting suspended/stuck. */
+      c.appendChild(txt('div','Capacity guard (emergency sign-in lock)',{style:{fontSize:'11px',fontWeight:'800',color:'var(--muted)',textTransform:'uppercase',letterSpacing:'.5px',margin:'12px 0 4px'}}));
+      const capStat=txt('div','',{style:{fontSize:'11px',fontWeight:'700',marginBottom:'4px'}});
+      function _capPaint(){const e=_capEffective();capStat.textContent=e.blocked?('LOCKED — new sign-ins paused until '+_capDateStr(e.until)):'Open — sign-ins allowed normally';capStat.style.color=e.blocked?'var(--danger)':'var(--muted)';}
+      _capPaint();c.appendChild(capStat);
+      const capCached=_capCached()||{};
+      const capUntil=el('input',{type:'date',value:(capCached.until?String(capCached.until).slice(0,10):''),style:{fontSize:'11px',width:'100%',marginBottom:'4px'}});
+      const capMsg=el('input',{type:'text',placeholder:'Optional note shown to users (e.g. why)',value:(capCached.message||''),style:{fontSize:'11px',width:'100%',marginBottom:'4px'}});
+      c.appendChild(capUntil);c.appendChild(capMsg);
+      const capRow=el('div',{style:{display:'flex',gap:'5px'}});
+      const capLock=txt('button','Lock sign-ins',{className:'btn small',style:{background:'var(--danger)',color:'#fff'}});
+      const capOpen=txt('button','Re-open now',{className:'btn small'});
+      capLock.onclick=async()=>{
+        const until=(capUntil.value||'').trim();
+        if(!until){toast('Pick the date sign-ins should re-open first.');return;}
+        if(!await kindleConfirm('Lock NEW sign-ins for everyone until '+_capDateStr(until)+'? You and already-signed-in users stay in. Use this when you\'re near the hosting quota.'))return;
+        capLock.disabled=true;const ok=await _capSet(true,until,(capMsg.value||'').trim());capLock.disabled=false;
+        if(ok){toast('Sign-ins LOCKED until '+_capDateStr(until)+'.',4000);_capPaint();}
+      };
+      capOpen.onclick=async()=>{capOpen.disabled=true;const ok=await _capSet(false,'','');capOpen.disabled=false;if(ok){toast('Sign-ins re-opened.',3000);_capPaint();}};
+      capRow.append(capLock,capOpen);c.appendChild(capRow);
+      c.appendChild(txt('div','When you see the Supabase quota warning, lock sign-ins until a date you pick — users get a clear "back on <date>" message and the project throttles itself instead of getting suspended. It auto-reopens on that date; "Re-open now" lifts it early. You and existing signed-in users are never locked out.',{style:{fontSize:'10px',color:'var(--muted)',marginTop:'4px',lineHeight:'1.5'}}));
       return c;
     }
     async function renderErrPanel(){
@@ -51531,6 +51953,9 @@ messages:()=>{
     /* ── Realtime subscription (Supabase) — falls back to polling ── */
     function subscribeRealtime(){
       if(!_sbActive())return false;
+      /* Realtime is Supabase-only; on the Cloudflare API gateway, fall back to
+         polling (Durable-Objects realtime is a separate Phase 2). */
+      if(typeof _apiGatewayUrl==='function'&&_apiGatewayUrl())return false;
       try{
         const url=SUPABASE_URL.replace(/^https?:/,'wss:').replace(/\/$/,'')
           +'/realtime/v1/websocket?apikey='+encodeURIComponent(SUPABASE_ANON_KEY)+'&vsn=1.0.0';
@@ -51609,6 +52034,14 @@ messages:()=>{
         const log2=document.getElementById('msgChatLog');
         if(!log2){stopPoll();cleanup();return;}
         try{
+          /* EGRESS: probe the newest message id first (~50 bytes). On a quiet
+             group this matches our current tail and we SKIP the full ~50-message
+             body download entirely — the no-realtime poll used to re-fetch the
+             whole list every 15s regardless. Only pull bodies when something new
+             arrived (mirrors the background notifier). */
+          const _latestId=await _groupLatestId(g.code);
+          const _curTail=_messages.length?_messages[_messages.length-1].id:'';
+          if(_latestId!==null&&_latestId===_curTail)return;
           const msgs=await _groupFetchMessages(g.code);
           /* Guard: a transient lookup failure surfaces as an empty array.
              Never replace a populated chat with nothing on one bad poll —
@@ -54409,6 +54842,12 @@ window._showWelcome=function(){
        5 minutes. Deliberately sparse to protect the Supabase quota. */
     setTimeout(()=>{try{_mailUnreadProbe();}catch(e){}},4000);
     setInterval(()=>{try{if(!document.hidden)_mailUnreadProbe();}catch(e){}},300000);
+    /* Capacity guard — if the admin has locked new sign-ins, surface the clear
+       "back on <date>" notice. Cached state gives an instant decision; the
+       refresh then covers first-visit / lifted lockdowns (and removes the
+       notice if it was lifted). */
+    setTimeout(()=>{try{if(typeof _capEffective==='function'&&_capEffective().blocked)_showCapacityNotice();}catch(_){}},400);
+    setTimeout(()=>{try{_refreshCapacity().then(function(){try{if(_capEffective().blocked)_showCapacityNotice();else{var n=document.getElementById('kh-cap-notice');if(n)n.remove();}}catch(_){}}).catch(function(){});}catch(_){}},1500);
     /* Auto-restore KindleOS launcher if it was the last active surface.
        Already detected up-front as `_willLaunchOS` — we just need to
        fire the actual launch now and pull down the bootmask. No setTimeout
