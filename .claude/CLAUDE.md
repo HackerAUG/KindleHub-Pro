@@ -48,7 +48,11 @@ network calls, minimal repaints (e-ink flashes on every DOM write), no reliance 
   buttons in `renderBooks`.
 - **Games**: each is an IIFE module (`const Hangman=(()=>{…})()`), launched via `launchGame(id)` → `_doLaunch`.
   Immersive overlay (`enterImmersive`/`exitImmersive`, `#immersiveRoot`). Some lazy-init via `_initX()`.
-  `newGameGuard(activeFn,start)` wraps "New Game" buttons to confirm mid-game.
+  `newGameGuard(activeFn,start)` wraps "New Game" buttons to confirm mid-game. New game = `case` in `_doLaunch`
+  + `gc(...)` card in `BUILDERS.games` + `GAME_HELP` entry + `GAME_MAP` entry + the id in `tools/games_test.cjs`.
+  `GeometryDash` (`const GeometryDash`) is a one-button auto-runner ("Stereo Madness"): fixed hand-authored
+  `LEVEL` array, canvas + flat fills, ~26fps `setInterval`; level is provably beatable (verified by a pure-
+  physics sim mirror — keep them in sync if you retune `G`/`JV`/`SPD`/`LEVEL`).
 - **KindleOS launcher**: `launchKindleDesktop()`, `openApp(app)` (built-in nav OR `customHTML` iframe overlay
   `#kd-customapp`), `closeApp()`. Custom AI-built apps in `osState.customApps`. KindleOS has its OWN tour
   (`startKindleOSTour`); the App-mode guided tour (`_showTutorial`) is suppressed while KindleOS is mounted.
@@ -60,6 +64,17 @@ network calls, minimal repaints (e-ink flashes on every DOM write), no reliance 
   Login UI (`_accForm` in `settings`, built via `_defer`) is a real `<form>` with `autocomplete=username/
   current-password` + a hidden submit, so the browser/OS keychain (e.g. Mac Safari) saves & autofills creds —
   the app itself never stores the plaintext password. Username prefill via `kh_last_user`.
+- **Egress / backend resilience**: the big per-user state blob can move OFF Supabase to **Cloudflare R2**
+  (`state-worker.js`) via `_stateGatewayUrl()` (`localStorage['kh_state_gateway']`) — zero egress fees. Helpers
+  `_r2PutState`/`_r2GetState`; R2 branches in `_saveUser`/`_loadUser`/`_maybePullFromCloud` + manual Sync.
+  Blank gateway = Supabase, behaves exactly as before. **Capacity Guard** (`_CAP_TAG='[[KH_CAP]]'`,
+  `_refreshCapacity`/`_capEffective`/`_capSet`/`_showCapacityNotice`): admin can CLOSE new sign-ins during a
+  quota emergency — stored as a reserved `[[KH_CAP]]` broadcast announcement (ANON-readable, no schema change,
+  auto-expiring `until` date). `authLogin`/`authRegister` block non-admins (admin username exempt via
+  `_isAdminUsername`); already-signed-in users are unaffected. Both gateway fields + the capacity controls live
+  in `buildLocalInsightsCard` (Admin → Local Insights). Filter `[[KH_CAP]]` records out of any announcement
+  DISPLAY. (Next backend step: full move to **Cloudflare D1 + Workers** — `api-worker.js`, PostgREST-subset over
+  D1, behind a `kh_api_gateway` toggle — to drop Supabase entirely; $0 egress.)
 - **Cloud sync merge** (`mergeCloudState`): id-lists (notes/books/flashDecks/mdJournals/calEvents/advStories)
   are UNIONED by id, so deletions need git-style tombstones — `S.deletedItems` (`<list>:<id>`→ts, SYNCED &
   unioned across devices like `leftGroups`) recorded by `_khTrackDeletions()` (a save-time diff of the lists
@@ -129,6 +144,16 @@ compare us to: it can read free Gutenberg/Libby books; we now read full text too
 Split screen / "2 pages in 1" multitasking — two stacked, independently-scrolling panes, each a real view;
 entry via the repurposed header "Recent" button (now the `_khOpenMultitask` panel). Delivered the community
 "multitasking" request; the heavier "true N-tab background multitasking incl. KindleOS" is still pending.
+
+Cloudflare R2 state gateway (zero-egress cloud sync, `state-worker.js`) + Capacity Guard (admin emergency
+sign-in lock with auto-expiring "back on <date>" message) — the permanent fix for the Supabase egress cap.
+Geometry Dash ("Stereo Madness" one-button rhythm runner, 30th game).
+
+Games gap vs **ReKindle**'s grid: we already have most of it (Codebreaker=Mastermind, Uno=Crazy Eights) PLUS
+games they lack (Slither, Space Invaders, Flight Sim, Tower Defence, Turbo Racer, DigQuest, Geometry Dash).
+Feasible-but-missing batch to add (all e-ink-friendly): Anagrams, Connections, Spelling Bee, Strands, Nerdle,
+Mini Crossword, Nonograms, Maze, Yahtzee, Perfect Circle, Dino (reskin of the GeometryDash engine). SKIP on
+e-ink: DOOM (fast raycaster), Pictionary-LIVE (realtime drawing — revisit if Durable Objects realtime lands).
 
 PENDING / bigger jobs (each its own session):
 - **True N-tab background multitasking** (keep 3+ activities alive at once, incl. KindleOS). Split screen
