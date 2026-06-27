@@ -6284,6 +6284,7 @@ const JS_BASE='https://api.jsonstorage.net/v1/json/'+JS_COL+'/';
    Supabase, exactly as today. */
 const KH_DEFAULT_STATE_GATEWAY='';   /* e.g. 'https://kindlehub-state.you.workers.dev' */
 const KH_DEFAULT_API_GATEWAY='';     /* e.g. 'https://kindlehub-api.you.workers.dev'   */
+const KH_DEFAULT_MAIL_GATEWAY='';    /* e.g. 'https://kindlehub-mail.you.workers.dev' — real email for ALL users */
 function _apiGatewayUrl(){try{const v=(localStorage.getItem('kh_api_gateway')||'').trim();if(v==='off')return '';return (v||KH_DEFAULT_API_GATEWAY).replace(/\/+$/,'');}catch(_){return (KH_DEFAULT_API_GATEWAY||'').replace(/\/+$/,'');}}
 function _sbBase(){const gw=_apiGatewayUrl();return gw||(SUPABASE_URL||'').replace(/\/$/,'');}
 function _sbActive(){
@@ -8961,6 +8962,9 @@ async function _uniqueUsername(name){
    hash(username+password), so sign-in is unaffected; the display name changes.
    Admin-run (reads the whole table), idempotent (re-running finds nothing). */
 async function _dedupeUsernames(onProgress){
+  /* Admin-only: this rewrites kh_users rows. Gate it like _khBanUsername etc. so
+     it can't be invoked by a non-admin (e.g. from the console). */
+  if(!window._adminToken)return {ok:false,error:'admin only'};
   if(typeof _sbActive!=='function'||!_sbActive())return {ok:false,error:'needs the Supabase backend'};
   let rows;
   try{ rows=await _sbSelectAll('kh_users','select=hash,email'); }catch(e){ return {ok:false,error:String(e&&e.message||e)}; }
@@ -9564,8 +9568,10 @@ function _mailIsExternal(addr){
    inbound mail for @kindlehub.pro via Email Routing. The URL is set once
    by the admin; empty = external sending disabled with a clear message. */
 function _mailGatewayUrl(){
-  try{const o=(localStorage.getItem('kh_mail_gateway')||'').trim();if(o)return o.replace(/\/+$/,'');}catch(_){}
-  return '';
+  /* Per-device localStorage override, else the baked-in fleet default. Set the
+     KH_DEFAULT_MAIL_GATEWAY constant + redeploy to turn external email on for
+     ALL users at once; a device can opt out with the localStorage value 'off'. */
+  try{const v=(localStorage.getItem('kh_mail_gateway')||'').trim();if(v==='off')return '';return (v||KH_DEFAULT_MAIL_GATEWAY).replace(/\/+$/,'');}catch(_){return (KH_DEFAULT_MAIL_GATEWAY||'').replace(/\/+$/,'');}
 }
 function _myMailUser(){return _mailNorm(S.email||'');}
 function _mailState(){if(!S.mailState||typeof S.mailState!=='object')S.mailState={};return S.mailState;}
@@ -37292,7 +37298,9 @@ Deno.serve(async (req)=>{
        gate its admin-only cards — but the tab itself is now available to ALL
        users, so anyone can run the AI bug-fix on their own errors. */
     try{ await _checkAdmin(); }catch(e){}
-    try{ _installAdminTab(); }catch(e){}
+    /* Admin lockdown: the Errors / AI-Fix / Diagnostics tab is admin-only now —
+       only install it once admin status has resolved to true. */
+    try{ if(window._isAdminCached===true) _installAdminTab(); }catch(e){}
   })();
 
   const boardSection=el('div');
