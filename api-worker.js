@@ -14,11 +14,30 @@
    policies, RPCs and storage-cap triggers from schema.sql are reimplemented
    here in code.
 
-   ── ONE-TIME SETUP (all free) ───────────────────────────────────────────────
-   1. Install wrangler:            npm i -g wrangler   (then `wrangler login`)
-   2. Create the database:         wrangler d1 create kindlehub
-        → copy the printed database_id.
-   3. Create wrangler.toml next to this file:
+   ── ONE-TIME SETUP (all free, no card) ──────────────────────────────────────
+   ★ You do NOT need to run schema-d1.sql by hand. On its first request this
+     Worker AUTO-CREATES every table (see ensureSchema below). So the whole setup
+     is: deploy the Worker + bind a D1 database + open the app once.
+
+   A) DASHBOARD ONLY (no CLI — recommended):
+   1. D1 → Create database, name it "kindlehub".
+   2. Workers & Pages → Create application → Worker → name it "kindlehub-api" →
+      Deploy the starter → Edit code → paste THIS whole file → Deploy.
+   3. That Worker → Settings → Bindings → Add binding → D1 database:
+        Variable name = DB     Database = kindlehub      → Deploy.
+   4. Hit the Worker URL once in a browser (it returns {"ok":true}) — that first
+      request creates all 13 tables. Verify in D1 → kindlehub → Tables.
+      ⚠ Do NOT try to paste schema-d1.sql into the dashboard:
+        • the D1 "Console" tab runs ONE statement per Execute (it's a single-line
+          box with /tables, /clear … slash commands); and
+        • the "Studio" (Explore Data) editor's Run only executes the statement at
+          the cursor — that's the "Executed 1/1 → only kh_users created" you saw.
+        The auto-create in step 4 does the entire job, so skip the SQL console.
+
+   B) WITH WRANGLER (CLI):
+   1. npm i -g wrangler   (then `wrangler login`)
+   2. wrangler d1 create kindlehub      → copy the printed database_id
+   3. wrangler.toml next to this file:
         name = "kindlehub-api"
         main = "api-worker.js"
         compatibility_date = "2024-09-23"
@@ -26,11 +45,13 @@
         binding = "DB"
         database_name = "kindlehub"
         database_id = "PASTE_THE_ID_HERE"
-   4. Load the schema:             wrangler d1 execute kindlehub --remote --file=schema-d1.sql
-   5. Deploy:                      wrangler deploy
-   6. Copy the Worker URL (e.g. https://kindlehub-api.YOURNAME.workers.dev) and
-      paste it into KindleHub: Admin → Local Insights → "API gateway (Cloudflare
-      D1)". Leave BLANK to keep using Supabase exactly as before.
+   4. wrangler deploy        (tables auto-create on first hit; to pre-load instead:
+        wrangler d1 execute kindlehub --remote --file=schema-d1.sql  — this runs the
+        WHOLE file reliably, unlike the dashboard editors.)
+
+   FINALLY (either path): copy the Worker URL (https://kindlehub-api.YOURNAME.
+   workers.dev) into KindleHub → Admin → Local Insights → "API gateway (Cloudflare
+   D1)". Leave BLANK to keep using Supabase exactly as before.
 
    SECURITY (mirrors the Supabase RLS model it replaces)
    • Reads + most inserts are open — same as the public anon key + permissive
@@ -81,7 +102,7 @@ function cors(env){
   return {
     'Access-Control-Allow-Origin': (env && env.ALLOW_ORIGIN) || '*',
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, HEAD, OPTIONS',
-    'Access-Control-Allow-Headers': 'apikey, authorization, content-type, prefer, x-kh-secret, range, range-unit, accept',
+    'Access-Control-Allow-Headers': 'apikey, authorization, content-type, prefer, x-kh-secret, x-kh-admin, range, range-unit, accept',
     'Access-Control-Expose-Headers': 'Content-Range',  // so _sbCount can read the total cross-origin
     'Access-Control-Max-Age': '86400',
   };
@@ -312,7 +333,13 @@ async function handleGet(table, url, request, env, DB, headOnly){
 }
 
 async function handlePost(table, url, request, env, DB){
-  if(!INSERT_OK.has(table)) return err('insert not allowed on '+table, 403, env);
+  /* Admin-authenticated bulk writes (the data-migration tool) may seed tables
+     that are otherwise insert-gated (announcements, bans) AND must bypass the
+     per-group/feedback rate limits so the copy isn't throttled. The admin token
+     is sent in X-KH-Admin, verified by SHA-256 against ADMIN_HASHES (same as the
+     RPCs). Without it, behaviour is exactly as before. */
+  const adminReq = await isAdmin(request.headers.get('x-kh-admin')||'');
+  if(!INSERT_OK.has(table) && !adminReq) return err('insert not allowed on '+table, 403, env);
   let payload; try{ payload = await request.json(); }catch(_){ return err('bad json',400,env); }
   const rows = Array.isArray(payload)?payload:[payload];
   const cols = COLUMNS[table];
@@ -321,8 +348,9 @@ async function handlePost(table, url, request, env, DB){
   const prefer = (request.headers.get('prefer')||'');
   const minimal = /return=minimal/i.test(prefer);
 
-  /* rate limits (ported from the BEFORE INSERT triggers) */
-  for(const row of rows){
+  /* rate limits (ported from the BEFORE INSERT triggers) — skipped for admin
+     bulk writes so the migration isn't throttled. */
+  if(!adminReq) for(const row of rows){
     if(table==='kh_messages'){ if(!await checkRate(DB,'msg:'+(row.group_code||''),30,60)) return err('Rate limit exceeded — max 30 messages per group per minute',429,env); }
     if(table==='kh_feedback'){ if(!await checkRate(DB,'fb:'+(row.type||''),10,60)) return err('Rate limit exceeded — max 10 feedback submissions per minute',429,env); }
   }
